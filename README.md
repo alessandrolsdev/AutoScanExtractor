@@ -4,8 +4,7 @@
 
 Este projeto foi criado como parte de um portfólio de desenvolvimento, demonstrando habilidades em automação de processos (RPA), reconhecimento óptico de caracteres (OCR) e desenvolvimento de interfaces gráficas.
 
-![Demonstração do Bot](demo.gif)
-*(Substitua esta linha por um screenshot ou GIF da interface do seu bot em ação)*
+![Demonstração do Bot](app.jpg)
 
 ---
 
@@ -60,7 +59,7 @@ Você **precisa** ter o Tesseract OCR Engine instalado no seu sistema (o script 
 
 1.  Clone o repositório:
     ```bash
-    git clone [https://github.com/](https://github.com/)[seu-usuario]/AutoScanExtractor.git
+    git clone https://github.com/alessandrolsdev/AutoScanExtractor.git
     ```
 2.  Navegue até a pasta do projeto:
     ```bash
@@ -102,4 +101,4 @@ Este projeto está sob a licença MIT. Veja o arquivo `LICENSE` (que você pode 
 
 ---
 
-Feito por **[Alessandro Lima da Silva]** - [[Seu LinkedIn ou GitHub](https://github.com/alessandrolsdev)]
+Feito por **[Alessandro Lima da Silva]** - [https://github.com/alessandrolsdev]

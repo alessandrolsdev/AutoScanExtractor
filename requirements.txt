@@ -3,6 +3,6 @@ pandas
 pillow
 pytesseract
 openpyxl
-
+PyMuPDF
 # Ferramenta de compilação
 pyinstaller
