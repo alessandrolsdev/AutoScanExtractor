@@ -1,0 +1,23 @@
+# Pastas e arquivos de compilação do PyInstaller
+/build/
+/dist/
+*.spec
+
+# Cache e logs do Python
+__pycache__/
+*.log
+*.pyc
+
+# Arquivos de ambiente virtual (ex: venv, .venv)
+venv/
+.venv/
+env/
+.env/
+
+# Arquivos de saída gerados pelo bot
+*.xlsx
+*.csv
+
+# Arquivos do sistema operacional
+.DS_Store
+Thumbs.db

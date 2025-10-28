@@ -1,0 +1,8 @@
+# Bibliotecas principais do aplicativo
+pandas
+pillow
+pytesseract
+openpyxl
+
+# Ferramenta de compilação
+pyinstaller
