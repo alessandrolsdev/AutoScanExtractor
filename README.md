@@ -4,7 +4,7 @@
 
 Este projeto foi criado como parte de um portfólio de desenvolvimento, demonstrando habilidades em automação de processos (RPA), reconhecimento óptico de caracteres (OCR) e desenvolvimento de interfaces gráficas.
 
-![Demonstração do Bot](app.jpg)
+![Demonstração do Bot](assets/app.jpg)
 
 ---
 
