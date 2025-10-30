@@ -9,7 +9,6 @@ de serviços externos, como o Tesseract.
 import os
 import sys
 import pytesseract
-from tkinter import messagebox
 import platform # Usado para encontrar o caminho padrão do Tesseract
 
 # --- Constantes de Extração ---
@@ -68,19 +67,21 @@ def setup_tesseract():
             if not os.path.isdir(tessdata_dir):
                 raise FileNotFoundError(f"Pasta tessdata não encontrada em (EXE) {tessdata_dir}")
 
-        else:
-            # --- MODO 2: RODANDO COMO SCRIPT .PY (DESENVOLVIMENTO / TESTE) ---
-            # Usa os caminhos definidos no topo deste arquivo
-            application_path = os.path.dirname(os.path.abspath(__file__)) # Raiz do projeto
-            
-            tesseract_exe_path = DEV_TESSERACT_PATH
-            tessdata_dir = DEV_TESSDATA_PATH
-
-            # Validação
-            if not os.path.exists(tesseract_exe_path):
-                raise FileNotFoundError(f"Tesseract (Dev) não encontrado em {tesseract_exe_path}. Verifique o caminho em DEV_TESSERACT_PATH no config.py.")
-            if not os.path.isdir(tessdata_dir):
-                raise FileNotFoundError(f"Pasta tessdata (Dev) não encontrada em {tessdata_dir}. Verifique o caminho em DEV_TESSDATA_PATH no config.py.")
+        
+else:
+    # --- MODO 2: RODANDO COMO SCRIPT .PY (DESENVOLVIMENTO / TESTE) ---
+    if platform.system() == "Windows":
+        # Windows (Sua máquina local)
+        application_path = os.path.dirname(os.path.abspath(__file__))
+        tesseract_exe_path = DEV_TESSERACT_PATH
+        tessdata_dir = DEV_TESSDATA_PATH
+    else:
+        # Linux (Robô do GitHub Actions) ou MacOS
+        # O `apt-get` instala o Tesseract no /usr/bin/
+        # e os dados em /usr/share/tessdata
+        application_path = os.path.dirname(os.path.abspath(__file__))
+        tesseract_exe_path = "/usr/bin/tesseract"
+        tessdata_dir = "/usr/share/tessdata"
 
         # --- Configuração Global (vale para os dois modos) ---
         
@@ -112,15 +113,12 @@ def setup_tesseract():
             print(f"AVISO: Erro durante a verificação do Tesseract: {te}")
             messagebox.showwarning("Aviso Tesseract", f"Ocorreu um problema ao verificar a instalação do Tesseract:\n{te}")
 
-    except Exception as e:
-        # Este é o bloco que está gerando o seu erro
-        error_message = (f"Não foi possível configurar o Tesseract OCR:\n{e}\n\n"
-                        f"Caminho base detectado: {application_path}\n"
-                        f"Tentativa Tesseract CMD: {tesseract_exe_path if 'tesseract_exe_path' in locals() else 'Não definido'}\n"
-                        f"Tentativa TESSDATA_PREFIX: {tessdata_dir if 'tessdata_dir' in locals() else 'Não definido'}\n\n"
-                        "Verifique se:\n"
-                        "1. O Tesseract está instalado corretamente em 'C:\\Program Files\\Tesseract-OCR'.\n"
-                        "2. Se estiver rodando como script, os caminhos DEV_ no config.py estão corretos.\n"
-                        "3. Se estiver empacotando, o .spec está correto.")
-        messagebox.showerror("Erro de Inicialização Tesseract", error_message)
-        sys.exit(1) # Faz o script (e o pytest) parar
+    
+except Exception as e:
+    # Loga o erro para o console (bom para CI) e re-levanta a exceção
+    error_message = (f"FALHA CRÍTICA no setup_tesseract:\n{e}\n\n"
+                    f"Caminho base detectado: {application_path}\n"
+                    f"Tentativa Tesseract CMD: {tesseract_exe_path if 'tesseract_exe_path' in locals() else 'Não definido'}\n"
+                    f"Tentativa TESSDATA_PREFIX: {tessdata_dir if 'tessdata_dir' in locals() else 'Não definido'}\n")
+    print(error_message) # Imprime o erro no log do CI
+    raise e # Re-levanta a exceção para o pytest ver
