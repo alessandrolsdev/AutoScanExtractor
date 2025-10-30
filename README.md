@@ -1,78 +1,80 @@
-# AutoScanExtractor 🤖
+# AutoScanExtractor 🤖 (Extrator de Boletos)
 
-> Ferramenta de automação em Python e Tkinter que utiliza OCR (Tesseract) para extrair dados de imagens e os estrutura em arquivos .xlsx usando Pandas.
+> Ferramenta em Python com GUI (Tkinter) que extrai dados-chave (Vencimento, Valor, Pagador) de **boletos bancários** (PDF ou Imagem) e os organiza em uma planilha Excel.
 
-Este projeto foi criado como parte de um portfólio de desenvolvimento, demonstrando habilidades em automação de processos (RPA), reconhecimento óptico de caracteres (OCR) e desenvolvimento de interfaces gráficas.
+Este projeto foi criado como parte de um portfólio de desenvolvimento, demonstrando habilidades em automação de processos (RPA), arquitetura de software modular, reconhecimento óptico de caracteres (OCR) e desenvolvimento de interfaces gráficas.
 
-![Demonstração do Bot](assets/app.jpg)
+![Demonstração do Bot](assets/app.jpg) 
 
 ---
 
 ## 📖 Sobre o Projeto
 
-Este projeto resolve o problema da extração manual de dados de imagens, como cronogramas, cardápios, listas de presença ou relatórios digitalizados.
+Este projeto resolve o problema da digitação manual de boletos em sistemas de controle financeiro. Em vez de um operador digitar "Vencimento", "Valor" e "Código de Barras" de dezenas de PDFs e imagens de boletos, este bot automatiza todo o processo:
 
-Em vez de um usuário digitar manualmente as informações de centenas de imagens em uma planilha, este bot automatiza todo o processo:
-
-1.  O usuário seleciona uma pasta através de uma interface gráfica simples.
-2.  O bot varre a pasta em busca de arquivos de imagem (JPG, PNG, etc.).
-3.  Ele utiliza a engine Tesseract OCR para "ler" o texto de cada imagem.
-4.  O texto extraído é processado para identificar e estruturar os dados relevantes (neste exemplo, dias, refeições e horários).
-5.  Todos os dados encontrados são consolidados e salvos em um único arquivo Excel (`.xlsx`) na mesma pasta.
+1.  O usuário seleciona os arquivos (PDFs ou Imagens) ou uma pasta inteira.
+2.  O usuário define onde deseja salvar a planilha de saída.
+3.  O bot processa cada arquivo em lote, usando uma **lógica híbrida**:
+    * **Se for PDF Digital:** Tenta extrair o texto diretamente, sem OCR (Modo 1 - Regex).
+    * **Se for PDF de Imagem ou .jpg/.png:** Aplica pré-processamento (OpenCV) e usa OCR (Tesseract) (Modo 1 - Regex).
+    * **Se o Modo 1 falhar:** Ativa um **Modo 2 (Posicional)**, que usa as coordenadas X/Y do texto para encontrar dados que o Regex não pegou (ex: "encontrar a data mais próxima da palavra 'Vencimento'").
+4.  Os dados são consolidados em uma única planilha Excel, pronta para uso.
 
 ## 🚀 Funcionalidades Principais
 
-* **Interface Gráfica (GUI):** Criada com `Tkinter` para ser intuitiva e fácil de usar.
-* **Seleção de Pasta:** Permite ao usuário escolher qualquer diretório do seu computador.
-* **Processamento em Lote:** Processa múltiplos arquivos de imagem de uma só vez.
-* **Extração com OCR:** Utiliza `Tesseract` para reconhecer texto em português.
-* **Estruturação de Dados:** Usa `Pandas` para organizar os dados extraídos em um formato de tabela.
-* **Exportação para Excel:** Gera um arquivo `.xlsx` limpo e organizado.
-* **Log de Atividades:** Mostra o status do processamento em tempo real na interface.
+* **Interface Gráfica (GUI):** Criada com `Tkinter` e `TTK` para ser moderna e intuitiva.
+* **Processamento em Lote:** Processa centenas de arquivos de uma só vez.
+* **Suporte a PDF e Imagem:** Processa arquivos `.pdf`, `.png`, `.jpg`, `.jpeg`, e mais.
+* **Extração Híbrida (Digital + OCR):** Detecta se um PDF é digital (baseado em texto) ou escaneado (baseado em imagem) e escolhe a melhor estratégia.
+* **Lógica Híbrida (Regex + Posicional):** Usa Regex para a extração rápida (Modo 1) e uma lógica de *fallback* baseada em coordenadas (Modo 2) para boletos difíceis.
+* **Pré-processamento de Imagem:** Utiliza `OpenCV` para aplicar filtros (binarização, redimensionamento) em imagens antes do OCR, melhorando drasticamente a precisão.
+* **Arquitetura Modular (MVC/Serviços):** O código é limpo e separado em responsabilidades (GUI, Lógica de Extração, Processador de Arquivos, Configuração).
+* **Empacotamento `.exe`:** Configurado com `PyInstaller` para gerar um executável único que embute o Tesseract e todas as dependências, sem necessidade de instalação.
+* **Testes Unitários:** A lógica de extração é coberta por testes `pytest`, garantindo que futuras mudanças não quebrem o código.
 
 ## 🛠️ Tecnologias Utilizadas
 
 * **[Python 3](https://www.python.org/)**
-* **[Tkinter](https://docs.python.org/3/library/tkinter.html)** - (Biblioteca nativa do Python) Para a interface gráfica.
+* **[Tkinter](https://docs.python.org/3/library/tkinter.html)** - Para a interface gráfica.
 * **[Tesseract OCR](https://github.com/tesseract-ocr/tesseract)** - A engine principal de reconhecimento de caracteres.
 * **[Pytesseract](https://pypi.org/project/pytesseract/)** - O "wrapper" Python para se comunicar com o Tesseract.
 * **[Pandas](https://pandas.pydata.org/)** - Para manipulação e exportação dos dados.
-* **[Pillow (PIL)](https://python-pillow.org/)** - Para abrir e manipular os arquivos de imagem.
+* **[Pillow (PIL)](https://python-pillow.org/)** - Para abrir imagens e gerenciar ícones da GUI.
+* **[PyMuPDF (fitz)](https://pypi.org/project/PyMuPDF/)** - Para extrair texto e renderizar imagens de arquivos PDF.
+* **[OpenCV (opencv-python-headless)](https://pypi.org/project/opencv-python-headless/)** - Para o pré-processamento de imagens.
+* **[Numpy](https://numpy.org/)** - Dependência principal do OpenCV.
 * **[Openpyxl](https://pypi.org/project/openpyxl/)** - Dependência do Pandas para escrever arquivos `.xlsx`.
+* **[PyInstaller](https://pyinstaller.org/)** - Para empacotar a aplicação em um `.exe`.
+* **[Pytest](https://pytest.org/)** - Para testes unitários.
 
 ---
 
 ## 🏁 Como Usar
 
-Para executar este projeto localmente, siga os passos abaixo.
+### 1. Pré-requisitos (Para o Executável `.exe`)
 
-### 1. Pré-requisitos
+* Nenhum! Basta baixar o `.exe` da seção "Releases" (se você criar uma) e executar. O Tesseract já está incluído.
 
-Você **precisa** ter o Tesseract OCR Engine instalado no seu sistema (o script Python apenas "chama" esse programa).
+### 2. Pré-requisitos (Para Rodar Localmente - Desenvolvimento)
+
+Você **precisa** ter o Tesseract OCR Engine instalado no seu sistema (o script Python "chama" esse programa).
 
 * **Windows:** Baixe e instale [a partir deste link](https://github.com/UB-Mannheim/tesseract/wiki).
     * **Importante:** Durante a instalação, na tela "Choose Components", certifique-se de marcar o suporte ao idioma "Portuguese" (em `Additional language data`).
 * **macOS:** `brew install tesseract tesseract-lang`
 * **Linux:** `sudo apt-get install tesseract-ocr tesseract-ocr-por`
 
-### 2. Instalação
+### 3. Instalação (Desenvolvimento)
 
 1.  Clone o repositório:
     ```bash
-    git clone https://github.com/alessandrolsdev/AutoScanExtractor.git
+    git clone [https://github.com/alessandrolsdev/AutoScanExtractor.git](https://github.com/alessandrolsdev/AutoScanExtractor.git)
     ```
 2.  Navegue até a pasta do projeto:
     ```bash
     cd AutoScanExtractor
     ```
-3.  Crie um arquivo chamado `requirements.txt` na raiz do projeto e cole o seguinte conteúdo:
-    ```
-    pandas
-    pillow
-    pytesseract
-    openpyxl
-    ```
-4.  (Recomendado) Crie um ambiente virtual:
+3.  (Recomendado) Crie um ambiente virtual:
     ```bash
     python -m venv venv
     ```
@@ -80,25 +82,54 @@ Você **precisa** ter o Tesseract OCR Engine instalado no seu sistema (o script 
     * Windows: `.\venv\Scripts\activate`
     * Mac/Linux: `source venv/bin/activate`
     
-5.  Instale as dependências:
+4.  Instale as dependências (o arquivo `requirements.txt` que corrigimos):
     ```bash
     pip install -r requirements.txt
     ```
 
-### 3. Executando o Bot
+### 4. Executando o Bot
 
-Com as dependências e o Tesseract instalados, basta executar o script principal:
+Com as dependências e o Tesseract instalados, basta executar o script `main.py`:
 
 ```bash
-python bot_com_interface.py
-```
+python main.py
+5. Gerando o Executável (.exe)
+Este projeto está configurado para ser compilado com PyInstaller usando um arquivo .spec que lida com todas as dependências complexas (incluindo o Tesseract).
 
-A interface gráfica será aberta. Use os botões para selecionar sua pasta de imagens e iniciar o processamento.
+Garanta que o PyInstaller está instalado:
 
-## 📝 Licença
+Bash
 
-Este projeto está sob a licença MIT. Veja o arquivo `LICENSE` (que você pode adicionar ao repositório) para mais detalhes.
+pip install pyinstaller
+Execute o PyInstaller apontando para o arquivo de especificação:
 
----
+Bash
 
-Feito por **[Alessandro Lima da Silva]** - [https://github.com/alessandrolsdev]
+pyinstaller AutoScanExtractor.spec
+O executável final e suas dependências estarão na pasta dist/.
+
+📁 Estrutura do Projeto
+O projeto foi refatorado para seguir padrões de arquitetura limpa, separando responsabilidades:
+
+/AutoScanExtractor
+|
++-- /assets           # Ícones da GUI e imagens do README
++-- /tests            # Testes unitários do Pytest
+|   +-- /test_data    # Arquivos PDF/JPG de amostra para os testes
+|   +-- test_extraction_logic.py
+|
++-- boleto_data.py    # Define a classe de dados `BoletoData` (o modelo)
++-- config.py         # Configuração do Tesseract e constantes
++-- extraction_logic.py # O "cérebro": Classe `BoletoParser` (Modo 1 e Modo 2)
++-- file_processor.py   # Lógica para ler PDFs e Imagens (PyMuPDF, OpenCV)
++-- gui.py            # Todo o código da GUI (Classes App e ExtractorService)
++-- main.py           # Ponto de entrada (inicia o app)
+|
++-- AutoScanExtractor.spec # Arquivo de build do PyInstaller
++-- .gitignore        # Ignora arquivos de build, cache e .xlsx
++-- README.md         # Este arquivo
++-- requirements.txt  # Lista de dependências Python
+📝 Licença
+Este projeto está sob a licença MIT.
+
+Feito por [Alessandro Lima da Silva] - [https://github.com/alessandrolsdev]

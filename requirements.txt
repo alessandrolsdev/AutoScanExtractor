@@ -1,18 +1,14 @@
 # Bibliotecas principais do aplicativo
 pandas
-pillow
-# pytesseract # Comentado - não usamos mais diretamente
 openpyxl
+pytesseract
 PyMuPDF
 opencv-python-headless
-# spacy # Comentado - não usamos mais
-torch # Dependência do EasyOCR
-torchvision # Dependência do EasyOCR
-torchaudio # Dependência do EasyOCR
-easyocr # Novo motor de OCR
+Pillow
+numpy
 
 # Ferramenta de compilação
 pyinstaller
 
-# Modelo de linguagem spaCy (Não usado nesta versão)
-# python -m spacy download pt_core_news_lg
+# Ferramenta de testes
+pytest
