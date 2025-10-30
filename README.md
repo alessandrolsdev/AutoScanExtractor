@@ -53,7 +53,7 @@ Este projeto resolve o problema da digitação manual de boletos em sistemas de 
 
 ### 1. Pré-requisitos (Para o Executável `.exe`)
 
-* Nenhum! Basta baixar o `.exe` da seção "Releases" (se você criar uma) e executar. O Tesseract já está incluído.
+* Nenhum! Basta baixar o `.zip` da seção **[Releases](https://github.com/alessandrolsdev/AutoScanExtractor/releases)** e executar. O Tesseract já está incluído.
 
 ### 2. Pré-requisitos (Para Rodar Localmente - Desenvolvimento)
 
@@ -68,7 +68,7 @@ Você **precisa** ter o Tesseract OCR Engine instalado no seu sistema (o script 
 
 1.  Clone o repositório:
     ```bash
-    git clone [https://github.com/alessandrolsdev/AutoScanExtractor.git](https://github.com/alessandrolsdev/AutoScanExtractor.git)
+    git clone https://github.com/alessandrolsdev/AutoScanExtractor.git
     ```
 2.  Navegue até a pasta do projeto:
     ```bash
@@ -82,7 +82,7 @@ Você **precisa** ter o Tesseract OCR Engine instalado no seu sistema (o script 
     * Windows: `.\venv\Scripts\activate`
     * Mac/Linux: `source venv/bin/activate`
     
-4.  Instale as dependências (o arquivo `requirements.txt` que corrigimos):
+4.  Instale as dependências:
     ```bash
     pip install -r requirements.txt
     ```
@@ -93,24 +93,29 @@ Com as dependências e o Tesseract instalados, basta executar o script `main.py`
 
 ```bash
 python main.py
-5. Gerando o Executável (.exe)
+```
+### 5. Gerando o Executável (.exe)
+
 Este projeto está configurado para ser compilado com PyInstaller usando um arquivo .spec que lida com todas as dependências complexas (incluindo o Tesseract).
 
 Garanta que o PyInstaller está instalado:
 
-Bash
+```bash
 
 pip install pyinstaller
+```
 Execute o PyInstaller apontando para o arquivo de especificação:
 
-Bash
+```bash
 
 pyinstaller AutoScanExtractor.spec
+```
 O executável final e suas dependências estarão na pasta dist/.
 
-📁 Estrutura do Projeto
-O projeto foi refatorado para seguir padrões de arquitetura limpa, separando responsabilidades:
+### 📁 Estrutura do Projeto
 
+O projeto foi refatorado para seguir padrões de arquitetura limpa, separando responsabilidades:
+```bash
 /AutoScanExtractor
 |
 +-- /assets           # Ícones da GUI e imagens do README
@@ -129,7 +134,9 @@ O projeto foi refatorado para seguir padrões de arquitetura limpa, separando re
 +-- .gitignore        # Ignora arquivos de build, cache e .xlsx
 +-- README.md         # Este arquivo
 +-- requirements.txt  # Lista de dependências Python
++-- LICENSE           # Licença MIT do projeto
+```
 📝 Licença
 Este projeto está sob a licença MIT.
 
-Feito por [Alessandro Lima da Silva] - [https://github.com/alessandrolsdev]
+Feito por **Alessandro Lima da Silva** ([@alessandrolsdev](https://github.com/alessandrolsdev))
