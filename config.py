@@ -16,19 +16,10 @@ DEFAULT_LANG = 'por'
 OCR_CONF_THRESHOLD = 40
 VALOR_MAX_DISTANCE = 700
 
-# --- CAMINHOS DE DESENVOLVIMENTO ---
-# Detecta o sistema operacional para definir os caminhos corretos
-DEV_TESSERACT_PATH = ""
-DEV_TESSDATA_PATH = ""
-
-if platform.system() == "Windows":
-    # Caminho padrão de instalação do Tesseract 64-bit no Windows
-    DEV_TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    DEV_TESSDATA_PATH = r"C:\Program Files\Tesseract-OCR\tessdata"
-else:
-    # Caminho padrão de instalação no Ubuntu (GitHub Actions)
-    DEV_TESSERACT_PATH = "/usr/bin/tesseract"
-    DEV_TESSDATA_PATH = "/usr/share/tessdata"
+# --- CAMINHOS DE DESENVOLVIMENTO (APENAS WINDOWS) ---
+# Usado para rodar 'python main.py' ou 'pytest' na sua máquina Windows
+DEV_TESSERACT_PATH_WINDOWS = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+DEV_TESSDATA_PATH_WINDOWS = r"C:\Program Files\Tesseract-OCR\tessdata"
 
 
 # --- FUNÇÃO HELPER PARA ENCONTRAR ARQUIVOS NO .EXE ---
@@ -43,16 +34,15 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# --- CONFIGURAÇÃO DO TESSERACT  ---
+# --- CONFIGURAÇÃO DO TESSERACT (VERSÃO 3.0 - CORRETA PARA CI) ---
 def setup_tesseract():
     """
     Define o caminho para o executável do Tesseract e seus dados.
-    Diferencia entre o modo de produção (.exe) e desenvolvimento (.py / pytest).
+    Diferencia entre o modo de produção (.exe), desenvolvimento Windows
+    e desenvolvimento Linux/CI.
     """
-    tesseract_exe_path = ""
-    tessdata_dir = ""
     application_path = ""
-
+    
     # Bloco TRY principal para pegar erros de configuração
     try:
         if getattr(sys, 'frozen', False):
@@ -68,51 +58,63 @@ def setup_tesseract():
             if not os.path.isdir(tessdata_dir):
                 raise FileNotFoundError(f"Pasta tessdata não encontrada em (EXE) {tessdata_dir}")
 
-        else:
-            # --- MODO 2: RODANDO COMO SCRIPT .PY (DESENVOLVIMENTO / TESTE) ---
+            # Define os caminhos para o Pytesseract
+            pytesseract.pytesseract.tesseract_cmd = tesseract_exe_path
+            os.environ['TESSDATA_PREFIX'] = tessdata_dir
+            print(f"INFO: Tesseract (EXE) configurado. CMD: {tesseract_exe_path}")
+
+        elif platform.system() == "Windows":
+            # --- MODO 2: RODANDO COMO SCRIPT .PY (DESENVOLVIMENTO - WINDOWS) ---
             application_path = os.path.dirname(os.path.abspath(__file__)) # Raiz do projeto
-            
-            tesseract_exe_path = DEV_TESSERACT_PATH
-            tessdata_dir = DEV_TESSDATA_PATH
+            tesseract_exe_path = DEV_TESSERACT_PATH_WINDOWS
+            tessdata_dir = DEV_TESSDATA_PATH_WINDOWS
 
             # Validação
             if not os.path.exists(tesseract_exe_path):
-                raise FileNotFoundError(f"Tesseract (Dev) não encontrado em {tesseract_exe_path}. Verifique o caminho no config.py.")
+                raise FileNotFoundError(f"Tesseract (Dev-Windows) não encontrado em {tesseract_exe_path}.")
             if not os.path.isdir(tessdata_dir):
-                raise FileNotFoundError(f"Pasta tessdata (Dev) não encontrada em {tessdata_dir}. Verifique o caminho no config.py.")
+                raise FileNotFoundError(f"Pasta tessdata (Dev-Windows) não encontrada em {tessdata_dir}.")
 
-        # --- Configuração Global (vale para os dois modos) ---
-        
-        pytesseract.pytesseract.tesseract_cmd = tesseract_exe_path
-        print(f"INFO: Caminho do Tesseract CMD definido para: {tesseract_exe_path}")
+            # Define os caminhos para o Pytesseract
+            pytesseract.pytesseract.tesseract_cmd = tesseract_exe_path
+            os.environ['TESSDATA_PREFIX'] = tessdata_dir
+            print(f"INFO: Tesseract (Dev-Windows) configurado. CMD: {tesseract_exe_path}")
 
-        os.environ['TESSDATA_PREFIX'] = tessdata_dir
-        print(f"INFO: TESSDATA_PREFIX definido para: {tessdata_dir}")
+        else:
+            # --- MODO 3: RODANDO COMO SCRIPT .PY (DESENVOLVIMENTO - LINUX/MAC/CI) ---
+            # Assumimos que Tesseract foi instalado no PATH do sistema
+            # (ex: via 'apt-get' ou 'brew').
+            # NÃO definimos 'tesseract_cmd' ou 'TESSDATA_PREFIX'.
+            # Deixamos o Pytesseract encontrar o Tesseract automaticamente.
+            application_path = os.path.dirname(os.path.abspath(__file__))
+            print("INFO: Tesseract (Dev-Linux/Mac/CI) - Usando Tesseract do PATH do sistema.")
+            # A validação de caminhos não é necessária, o Pytesseract fará isso abaixo.
 
-        # --- Verificação  ---
-        # Este try/except é *aninhado* dentro do try principal
+        # --- Verificação Global (roda para todos os modos) ---
         try:
             version = pytesseract.get_tesseract_version()
             languages = pytesseract.get_languages(config='')
             print(f"INFO: Versão Tesseract detectada: {version}")
             
             if DEFAULT_LANG not in languages:
-                print(f"AVISO: Idioma '{DEFAULT_LANG}' (Português) não foi encontrado nos dados do Tesseract!")
+                print(f"AVISO: Idioma '{DEFAULT_LANG}' (Português) não foi encontrado!")
+                # No CI, isso é um erro fatal, pois o 'por' foi explicitamente instalado.
+                if platform.system() != "Windows":
+                     raise FileNotFoundError(f"Idioma '{DEFAULT_LANG}' não encontrado pelo Tesseract no CI.")
             else:
                 print(f"INFO: Idioma '{DEFAULT_LANG}' (Português) encontrado em tessdata.")
                 
-        except pytesseract.TesseractNotFoundError:
-            # Este erro não deve acontecer se as validações acima passaram
-            raise FileNotFoundError(f"Tesseract não executável no caminho: {pytesseract.pytesseract.tesseract_cmd}")
+        except pytesseract.TesseractNotFoundError as e_find:
+            # Isso vai pegar o erro se o Modo 3 (Linux) não encontrar o Tesseract
+            print(f"FALHA CRÍTICA: Pytesseract não encontrou o Tesseract no PATH do sistema.")
+            raise e_find
         except Exception as te:
             print(f"AVISO: Erro durante a verificação do Tesseract: {te}")
 
-    # Bloco EXCEPT principal 
+    # Bloco EXCEPT principal (sem tkinter)
     except Exception as e:
         # Loga o erro para o console (bom para CI) e re-levanta a exceção
         error_message = (f"FALHA CRÍTICA no setup_tesseract:\n{e}\n\n"
-                        f"Caminho base detectado: {application_path}\n"
-                        f"Tentativa Tesseract CMD: {tesseract_exe_path if 'tesseract_exe_path' in locals() else 'Não definido'}\n"
-                        f"Tentativa TESSDATA_PREFIX: {tessdata_dir if 'tessdata_dir' in locals() else 'Não definido'}\n")
-        print(error_message) # Imprime o erro no log do CI
+                        f"Caminho base detectado: {application_path}\n")
+        print(error_message) 
         raise e # Re-levanta a exceção para o pytest ver
