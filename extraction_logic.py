@@ -2,564 +2,761 @@
 """
 extraction_logic.py
 
-Contém a classe principal 'BoletoParser' e todas as sub-funções
-de extração de dados (Modo 1 - Regex e Modo 2 - Posicional).
+A classe ``BoletoParser`` e a estratégia de extração em três camadas.
 
-Este módulo não sabe sobre arquivos, PDFs ou GUIs. Ele apenas
-recebe texto ou dados posicionais e retorna dados estruturados.
+Ordem de tentativa (da mais confiável para a menos):
+
+    0. **Linha digitável** — se os dígitos verificadores fecham, vencimento e
+       valor vêm da aritmética do próprio boleto, não de palpite de layout.
+    1. **Regex** sobre o texto (digital ou OCR) — resolve beneficiário, pagador
+       e os campos que a linha digitável não carrega.
+    2. **Posicional** — usa as coordenadas X/Y das palavras para achar o que a
+       regex não achou, por proximidade dos rótulos.
+
+Uma camada nunca sobrescreve o resultado de outra mais confiável: quem decide
+é ``Campo.definir``, pela precedência declarada em ``Origem``.
+
+Este módulo não conhece arquivos, PDFs nem GUI: recebe texto ou dados
+posicionais e devolve dados estruturados.
 """
 
-import re
+from __future__ import annotations
+
+import logging
 import math
+import re
+import unicodedata
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from typing import Iterable, List, Optional, Sequence, Tuple
+
 import pandas as pd
-from pytesseract import Output
-import pytesseract
-from PIL.Image import Image # Usado para Type Hinting
-import dataclasses
 
-# Importações de nossos módulos
-from boleto_data import BoletoData
+import linha_digitavel as ld
+from boleto_data import BoletoData, Campo, Origem, Regiao
+from config import ANO_MAXIMO_PLAUSIVEL, ANO_MINIMO_PLAUSIVEL, OCR_CONF_THRESHOLD, VALOR_MAX_DISTANCE
 
-from config import DEFAULT_LANG, OCR_CONF_THRESHOLD, VALOR_MAX_DISTANCE
+logger = logging.getLogger(__name__)
 
-# --- Definição de Exceções Customizadas ---
+
+# --- Exceções ---------------------------------------------------------------
+
 class ExtractionError(Exception):
     """Erro base para falhas de extração."""
-    pass
+
 
 class OCRError(ExtractionError):
     """Falha ao rodar o Tesseract."""
-    pass
+
 
 class LayoutNaoReconhecidoError(ExtractionError):
-    """Não foi possível encontrar os campos principais (ex: Modo 1 e 2 falharam)."""
-    pass
+    """Não foi possível encontrar nenhum campo no documento."""
 
+
+# --- Palavra posicionada (abstração comum a OCR e PDF digital) --------------
+
+class Palavra:
+    """
+    Uma palavra com posição na página.
+
+    Serve tanto para as palavras do Tesseract quanto para as do texto digital
+    do PDF, o que permite que a localização visual dos campos funcione nos
+    dois modos com o mesmo código.
+    """
+
+    __slots__ = ("texto", "x", "y", "largura", "altura", "pagina")
+
+    def __init__(self, texto: str, x: int, y: int, largura: int, altura: int, pagina: int = 0):
+        self.texto = texto
+        self.x = int(x)
+        self.y = int(y)
+        self.largura = int(largura)
+        self.altura = int(altura)
+        self.pagina = pagina
+
+    @property
+    def centro(self) -> Tuple[int, int]:
+        return (self.x + self.largura // 2, self.y + self.altura // 2)
+
+    def regiao(self) -> Regiao:
+        return Regiao(self.x, self.y, self.largura, self.altura, self.pagina)
+
+    def __repr__(self) -> str:  # pragma: no cover - only for debugging
+        return f"Palavra({self.texto!r}, {self.x}, {self.y})"
+
+
+def _normalizar(texto: str) -> str:
+    """Minúsculas, sem acento e sem pontuação — para comparar textos de OCR."""
+    sem_acento = unicodedata.normalize("NFKD", texto)
+    sem_acento = "".join(c for c in sem_acento if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", sem_acento.lower())
+
+
+def unir_regioes(palavras: Sequence[Palavra]) -> Optional[Regiao]:
+    """Retângulo que envolve todas as palavras informadas."""
+    if not palavras:
+        return None
+    esquerda = min(p.x for p in palavras)
+    topo = min(p.y for p in palavras)
+    direita = max(p.x + p.largura for p in palavras)
+    base = max(p.y + p.altura for p in palavras)
+    return Regiao(esquerda, topo, direita - esquerda, base - topo, palavras[0].pagina)
+
+
+def _mais_proxima_do_rotulo(
+    ocorrencias: Sequence[Regiao],
+    palavras: Sequence[Palavra],
+    palavras_chave: Sequence[str],
+) -> Regiao:
+    """Entre várias ocorrências do mesmo texto, escolhe a mais perto do rótulo."""
+    if len(ocorrencias) == 1 or not palavras_chave:
+        return ocorrencias[0]
+
+    rotulos = [
+        p for p in palavras
+        if any(chave in _normalizar(p.texto) for chave in palavras_chave)
+    ]
+    if not rotulos:
+        return ocorrencias[0]
+
+    def distancia_ao_rotulo(regiao: Regiao) -> float:
+        centro = (regiao.x + regiao.largura / 2, regiao.y + regiao.altura / 2)
+        return min(math.dist(centro, rotulo.centro) for rotulo in rotulos)
+
+    return min(ocorrencias, key=distancia_ao_rotulo)
+
+
+def localizar_texto(
+    palavras: Sequence[Palavra],
+    alvo: str,
+    max_palavras: int = 8,
+    perto_de: Sequence[str] = (),
+) -> Optional[Regiao]:
+    """
+    Acha onde um texto extraído aparece entre as palavras da página.
+
+    Testa sequências consecutivas de palavras e devolve a região da que
+    corresponde ao alvo normalizado. É assim que o modo de inspeção consegue
+    desenhar a caixa mesmo para campos achados por regex, que por natureza não
+    têm coordenadas.
+
+    ``perto_de`` lista palavras-chave do rótulo do campo. Um mesmo valor
+    costuma aparecer várias vezes no boleto (um total repetido no resumo e no
+    campo próprio); havendo empate, vence a ocorrência mais próxima do rótulo.
+    """
+    alvo_normalizado = _normalizar(alvo)
+    if not alvo_normalizado or not palavras:
+        return None
+
+    ocorrencias: List[Regiao] = []
+    for inicio in range(len(palavras)):
+        acumulado = ""
+        for fim in range(inicio, min(inicio + max_palavras, len(palavras))):
+            acumulado += _normalizar(palavras[fim].texto)
+            if not acumulado:
+                continue
+            if acumulado == alvo_normalizado:
+                ocorrencias.append(unir_regioes(palavras[inicio:fim + 1]))
+                break
+            if len(acumulado) >= len(alvo_normalizado):
+                break
+
+    if ocorrencias:
+        return _mais_proxima_do_rotulo(ocorrencias, palavras, perto_de)
+    # Segunda passada, mais tolerante: aceita uma palavra que contenha o alvo.
+    #
+    # O limite de comprimento importa: "106,00" está contido no fim da própria
+    # linha digitável ("...83100000010600"), e sem essa guarda o valor seria
+    # apontado no código de barras em vez de no campo "Valor do Documento".
+    limite = len(alvo_normalizado) * 2
+    melhor: Optional[Palavra] = None
+    for palavra in palavras:
+        normalizada = _normalizar(palavra.texto)
+        if alvo_normalizado not in normalizada or len(normalizada) > limite:
+            continue
+        if melhor is None or len(normalizada) < len(_normalizar(melhor.texto)):
+            melhor = palavra
+    return melhor.regiao() if melhor else None
+
+
+# --- Parser -----------------------------------------------------------------
 
 class BoletoParser:
-    """
-    Classe que encapsula toda a lógica de extração de dados de boletos.
-    Combina as abordagens de Regex (Modo 1) e Posicional (Modo 2).
-    """
+    """Extrai os dados de um boleto a partir de texto e/ou palavras posicionadas."""
 
-    # --- MODO 1: LÓGICA DE REGEX (Seu 'parse_boleto_text') ---
-    
-    def parse_modo1_regex(self, texto_extraido: str, nome_arquivo_origem: str) -> BoletoData:
+    # Rótulos de valor, do mais específico para o mais genérico.
+    _REGEX_LIXO = r"[^\n\d]*"
+    _REGEX_VALOR = r"([ \d\.]*,\d{2})"
+    PADROES_VALOR = (
+        r"(?:=\)\s*)?Valor (?:do )?Documento" + _REGEX_LIXO + _REGEX_VALOR,
+        r"=\)\s*Valor\s*(?:do )?Documento\s*\n" + _REGEX_LIXO + _REGEX_VALOR,
+        r"Valor (?:do )?Documento\s*\n" + _REGEX_LIXO + _REGEX_VALOR,
+        r"Valor Cobrado" + _REGEX_LIXO + _REGEX_VALOR,
+        r"Valor Cobrado\s*\n" + _REGEX_LIXO + _REGEX_VALOR,
+        r"^\s*Valor\s+" + _REGEX_LIXO + _REGEX_VALOR,
+    )
+
+    PADROES_VENCIMENTO_CONTEXTO = (
+        r"vencimento\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+        r"venc\.?\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+        r"vencto\.?\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+    )
+
+    REGEX_DATA = re.compile(r"\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b")
+
+    #: Rótulo que às vezes vem colado ao nome capturado.
+    REGEX_ROTULO_INICIAL = re.compile(
+        # "nome" fica de fora de propósito: é palavra comum demais e chegaria a
+        # cortar o início de razões sociais legítimas.
+        r"^\s*(?:benefici[áao]rio|cedente|pagador|sacado)\s*[:\-–—]?\s*", re.IGNORECASE
+    )
+
+    #: Fragmentos do rótulo de cada campo, usados para desempatar a localização
+    #: visual quando o mesmo texto aparece em mais de um lugar do boleto.
+    ROTULOS_POR_CAMPO = {
+        "vencimento": ("venc",),
+        "valor_documento": ("valor", "documento"),
+        "beneficiario": ("benefici",),
+        "pagador": ("pagador",),
+    }
+
+    LIXO_SEM_VALOR = (
+        "NOSSO NÚMERO", "AGÊNCIA", "CÓDIGO BENEFICIÁRIO", "VENCIMENTO",
+        "RECIBO DO PAGADOR", "AUTENTICAÇÃO MECANICA",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Camada 0 + 1: linha digitável e regex sobre texto
+    # ------------------------------------------------------------------ #
+
+    def extrair_de_texto(
+        self,
+        texto: str,
+        dados: BoletoData,
+        origem: str = Origem.REGEX,
+        referencia: Optional[date] = None,
+    ) -> BoletoData:
         """
-        MODO 1: Extração baseada em Expressões Regulares (Regex) aplicadas ao texto completo extraído.
+        Aplica a linha digitável e depois as regex sobre um texto.
+
+        ``origem`` distingue texto digital de texto de OCR, para que o dado
+        digital (mais confiável) não seja sobrescrito pelo do OCR depois.
         """
-        print(f"\n--- DEBUG (V21.0): Iniciando parse (MODO 1 - REGEX) para {nome_arquivo_origem} ---")
+        if not texto:
+            return dados
 
-        # Usa o BoletoData em vez de um dicionário
-        dados_encontrados = BoletoData(arquivo_origem=nome_arquivo_origem)
-        texto_trabalho = texto_extraido
-        match_codigo = None
+        self._extrair_linha_digitavel(texto, dados, referencia)
+        self._extrair_vencimento(texto, dados, origem)
+        self._extrair_valor(texto, dados, origem)
+        self._extrair_beneficiario(texto, dados, origem)
+        self._extrair_pagador(texto, dados, origem)
+        return dados
 
-        # --- 1. Regex para Código de Barras ---
-        print("--- DEBUG (V21.0): Tentando encontrar Código de Barras...")
-        match_codigo = re.search( r"(\d{5}\.[_O\d]{5}\s+[_O\d]{5}\.[_O\d]{6}\s+[_O\d]{5}\.[_O\d]{6}\s+[_O\d]\s+[_O\d]{14})", texto_trabalho )
-        if not match_codigo: match_codigo = re.search( r"([\dO]{9}[\.\s]?[\dO][\s\n]+[\dO]{10}[\.\s]?[\dO][\s\n]+[\dO]{10}[\.\s]?[\dO][\s\n]+[\dO][\s\n]+[\dO]{14})", texto_trabalho, re.IGNORECASE )
-        if not match_codigo: match_codigo = re.search( r"([\dO]{5}[^\d\n]?[\dO]{5}[\s\n]+[\dO]{5}[^\d\n]?[\dO]{6}[\s\n]+[\dO]{5}[^\d\n]?[\dO]{6}[\s\n]+[\dO][\s\n]+[\dO]{14})", texto_trabalho, re.IGNORECASE )
-        if not match_codigo:
-            match_codigo_flex = re.search( r"(\d{5})\D?(\d{5})\D?(\d{5})\D?(\d{6})\D?(\d{5})\D?(\d{6})\D?(\d)\D?(\d{14})", texto_trabalho)
-            if match_codigo_flex:
-                groups = match_codigo_flex.groups()
-                codigo_formatado = f"{groups[0]}.{groups[1]} {groups[2]}.{groups[3]} {groups[4]}.{groups[5]} {groups[6]} {groups[7]}"
-                dados_encontrados.codigo_barras = codigo_formatado
-                print(f"--- DEBUG (V21.0): Código de Barras encontrado (Flex): {dados_encontrados.codigo_barras}")
+    def _extrair_linha_digitavel(
+        self, texto: str, dados: BoletoData, referencia: Optional[date] = None
+    ) -> None:
+        """Camada 0: dados autoverificados pelos dígitos verificadores."""
+        if dados.linha_digitavel_valida:
+            return
 
-        if match_codigo and dados_encontrados.codigo_barras == 'Não encontrado':
-            codigo_limpo = re.sub(r"[\s\n]+", " ", match_codigo.group(1))
-            dados_encontrados.codigo_barras = codigo_limpo.replace("O", "0").replace("o", "0").replace("_", "0")
-            print(f"--- DEBUG (V2V21.0): Código de Barras encontrado (Cascata): {dados_encontrados.codigo_barras}")
-        if dados_encontrados.codigo_barras == 'Não encontrado':
-            print("--- DEBUG (V21.0): Código de Barras NÃO encontrado.")
+        decodificado = ld.encontrar_linha_digitavel(texto, referencia=referencia)
+        if decodificado is None:
+            logger.debug("Nenhuma linha digitável válida no texto.")
+            return
 
-        # --- 2. Regex para Data de Vencimento ---
-        print("--- DEBUG (V21.0): Tentando encontrar Vencimento (Regex Direto)...")
-        match_vencimento = re.search(r"Venciment[o|a|u][\s\n]*([\dOS]{2}/[\dOS]{2}/[\dOS]{4})", texto_trabalho, re.IGNORECASE)
-        if match_vencimento:
-            vencimento_sujo = match_vencimento.group(1)
-            dados_encontrados.vencimento = vencimento_sujo.replace("O", "0").replace("S", "5")
-            print(f"--- DEBUG (V21.0): Vencimento encontrado (Regex Direto): {dados_encontrados.vencimento}")
-        else:
-            print("--- DEBUG (V21.0): Vencimento NÃO encontrado (Regex Direto).")
-            # Usa o método privado da classe
-            venc_contexto = self._extrair_vencimento_regex_contexto(texto_trabalho)
-            if venc_contexto:
-                dados_encontrados.vencimento = venc_contexto.replace("O", "0").replace("S", "5")
-                print(f"--- DEBUG (V21.0): Vencimento encontrado (Regex Contexto): {dados_encontrados.vencimento}")
+        dados.linha_digitavel_valida = True
+        dados.codigo_barras.definir(
+            decodificado.linha_formatada,
+            texto_bruto=decodificado.linha_formatada,
+            origem=Origem.LINHA_DIGITAVEL,
+        )
+        if decodificado.vencimento:
+            dados.vencimento.definir(
+                decodificado.vencimento,
+                texto_bruto=decodificado.vencimento.strftime("%d/%m/%Y"),
+                origem=Origem.LINHA_DIGITAVEL,
+            )
+        if decodificado.valor:
+            dados.valor_documento.definir(
+                decodificado.valor,
+                texto_bruto=f"{decodificado.valor:.2f}".replace(".", ","),
+                origem=Origem.LINHA_DIGITAVEL,
+            )
+        logger.info(
+            "Linha digitável validada (banco %s): vencimento=%s valor=%s",
+            decodificado.banco, decodificado.vencimento, decodificado.valor,
+        )
 
-        # --- 3. Regex para Beneficiário ---
-        print("--- DEBUG (V21.0): Tentando encontrar Beneficiário (via Número CNPJ)...")
-        match_linha_cnpj = re.search(r"^\s*(.*?CNPJ\s*\d{2}[\.\s]?\d{3}[\.\s]?\d{3}/\d{4}[\-\s]?\d{2}.*)$", texto_trabalho, re.MULTILINE | re.IGNORECASE)
-        beneficiario_encontrado = False
-        if match_linha_cnpj:
-            print("--- DEBUG (V21.0): Encontrou linha com CNPJ.")
-            linha_completa = match_linha_cnpj.group(1).strip()
-            match_nome_mesma_linha = re.search(r"^([^\n]+?)\s*CNPJ", linha_completa, re.IGNORECASE)
-            # Usa o método privado da classe
-            if match_nome_mesma_linha and self._is_valid_candidate(match_nome_mesma_linha.group(1)):
-                    dados_encontrados.beneficiario = match_nome_mesma_linha.group(1).strip()
-                    beneficiario_encontrado = True
-                    print(f"--- DEBUG (V21.0): Beneficiário encontrado (mesma linha CNPJ): {dados_encontrados.beneficiario}")
-            else:
-                print("--- DEBUG (V21.0): Não encontrou nome na mesma linha do CNPJ. Tentando linha anterior...")
-                pos_inicio_linha_cnpj = match_linha_cnpj.start()
-                texto_antes = texto_trabalho[:pos_inicio_linha_cnpj].strip()
-                linhas_antes = texto_antes.split('\n')
-                if linhas_antes and linhas_antes[-1].strip():
-                    linha_anterior = linhas_antes[-1].strip()
-                    if self._is_valid_candidate(linha_anterior):
-                            dados_encontrados.beneficiario = linha_anterior
-                            beneficiario_encontrado = True
-                            print(f"--- DEBUG (V21.0): Beneficiário encontrado (linha anterior CNPJ): {dados_encontrados.beneficiario}")
-                    else:
-                            print(f"--- DEBUG (V21.0): Candidato (linha anterior CNPJ) REJEITADO pela validação: '{linha_anterior}'")
-        else:
-            print("--- DEBUG (V21.0): Não encontrou linha com CNPJ.")
+    # --- Vencimento --------------------------------------------------------
 
-        if not beneficiario_encontrado:
-            print("--- DEBUG (V21.0): Tentando fallback 1 (Mesma Linha)...")
-            match_empresa = re.search(r"(?<!CÓDIGO\s)(?<!Agência\s/\sCódigo\s)Benefici[á|a|o]rio[^\w\n]*([^\n]+)", texto_trabalho, re.MULTILINE | re.IGNORECASE)
-            if match_empresa:
-                nome_bruto = match_empresa.group(1).strip()
-                nome_sem_cnpj = re.sub(r'\s*CNPJ.*$', '', nome_bruto, flags=re.IGNORECASE).strip()
-                if self._is_valid_candidate(nome_sem_cnpj):
-                    dados_encontrados.beneficiario = nome_sem_cnpj
-                    beneficiario_encontrado = True
-                    print(f"--- DEBUG (V21.0): Beneficiário encontrado (Fallback 1 - Mesma Linha): {dados_encontrados.beneficiario}")
-                else:
-                    print(f"--- DEBUG (V21.0): Candidato (Fallback 1) REJEITADO: '{nome_sem_cnpj}'")
+    def _extrair_vencimento(self, texto: str, dados: BoletoData, origem: str) -> None:
+        if dados.vencimento.encontrado:
+            return
 
-        if not beneficiario_encontrado:
-            print("--- DEBUG (V21.0): Tentando fallback 2 (Próxima Linha)...")
-            match_empresa = re.search(r"(?<!CÓDIGO\s)(?<!Agência\s/\sCódigo\s)Benefici[á|a|o]rio\s*\n\s*([^\n]+)", texto_trabalho, re.MULTILINE | re.IGNORECASE)
-            if match_empresa:
-                nome_bruto = match_empresa.group(1).strip()
-                if "CNPJ" not in nome_bruto.upper() and self._is_valid_candidate(nome_bruto):
-                    dados_encontrados.beneficiario = nome_bruto
-                    beneficiario_encontrado = True
-                    print(f"--- DEBUG (V21.0): Beneficiário encontrado (Fallback 2 - Próxima Linha): {dados_encontrados.beneficiario}")
-                else:
-                    print(f"--- DEBUG (V21.0): Candidato (Fallback 2) REJEITADO: '{nome_bruto}'")
+        match = re.search(
+            r"Venciment[oau][\s\n]*([\dOS]{2}/[\dOS]{2}/[\dOS]{4})", texto, re.IGNORECASE
+        )
+        bruto = match.group(1) if match else self._extrair_vencimento_regex_contexto(texto)
+        if not bruto:
+            logger.debug("Vencimento não encontrado por regex.")
+            return
 
-        if not beneficiario_encontrado:
-                print("--- DEBUG (V21.0): Beneficiário NÃO encontrado após todas as tentativas.")
+        data = self._parse_data(bruto)
+        if data and dados.vencimento.definir(data, texto_bruto=bruto, origem=origem):
+            logger.info("Vencimento por regex: %s", data)
 
-        # --- 4. Regex para Pagador ---
-        print("--- DEBUG (V21.0): Tentando encontrar Pagador (via CPF)...")
-        match_cpf = re.search(r"CPF[:\s]*(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})", texto_trabalho, re.MULTILINE | re.IGNORECASE)
-        pagador_encontrado = False
-        if match_cpf:
-            print(f"--- DEBUG (V21.0): Encontrou padrão numérico CPF: '{match_cpf.group(1)}'")
-            pos_cpf = match_cpf.start()
-            inicio_linha_cpf = texto_trabalho.rfind('\n', 0, pos_cpf) + 1
-            texto_antes_cpf = texto_trabalho[inicio_linha_cpf:pos_cpf].strip()
-            match_pagador_mesma_linha = re.search(r"Pagador:?\s+(.+)", texto_antes_cpf, re.IGNORECASE)
-            if match_pagador_mesma_linha and self._is_valid_candidate(match_pagador_mesma_linha.group(1)):
-                dados_encontrados.pagador = match_pagador_mesma_linha.group(1).strip()
-                pagador_encontrado = True
-                print(f"--- DEBUG (V2V21.0): Pagador encontrado (mesma linha CPF): {dados_encontrados.pagador}")
-            else:
-                print("--- DEBUG (V21.0): Não encontrou Pagador na mesma linha do CPF. Tentando linha anterior...")
-                texto_antes_cpf = texto_trabalho[:pos_cpf].strip()
-                linhas_antes = texto_antes_cpf.split('\n')
-                if len(linhas_antes) > 0:
-                    linha_anterior = linhas_antes[-1].strip()
-                    if len(linhas_antes) > 1 and re.search(r"Pagador", linhas_antes[-2], re.IGNORECASE):
-                            if self._is_valid_candidate(linha_anterior):
-                                dados_encontrados.pagador = linha_anterior
-                                pagador_encontrado = True
-                                print(f"--- DEBUG (V21.0): Pagador encontrado (linha anterior CPF): {dados_encontrados.pagador}")
-                            else: print(f"--- DEBUG (V21.0): Candidato (linha anterior CPF) REJEITADO: '{linha_anterior}'")
-                else: print("--- DEBUG (V21.0): Não encontrou linha anterior ao CPF.")
-        else:
-            print("--- DEBUG (V21.0): Não encontrou padrão numérico do CPF.")
-
-        if not pagador_encontrado:
-            print("--- DEBUG (V21.0): Tentando fallback do Pagador...")
-            match_pagador = re.search(r"^\s*Pagador:?\s+([^\n]+?)(?=\s*CPF|$)", texto_trabalho, re.MULTILINE | re.IGNORECASE)
-            if not match_pagador: match_pagador = re.search(r"^\s*Pagador\s*\n\s*([^\n]+?)(?=\s*CPF|$)", texto_trabalho, re.MULTILINE | re.IGNORECASE)
-            if match_pagador:
-                    nome_pagador_bruto = match_pagador.group(1).strip()
-                    if self._is_valid_candidate(nome_pagador_bruto):
-                        dados_encontrados.pagador = nome_pagador_bruto
-                        pagador_encontrado = True
-                        print(f"--- DEBUG (V21.0): Pagador encontrado (fallback): {dados_encontrados.pagador}")
-                    else: print(f"--- DEBUG (V21.0): Candidato (fallback) REJEITADO: '{nome_pagador_bruto}'")
-
-        if dados_encontrados.pagador != 'Não encontrado':
-            dados_encontrados.pagador = re.sub(r'\s*-\s*$', '', dados_encontrados.pagador).strip()
-        if not pagador_encontrado:
-            print("--- DEBUG (V21.0): Pagador NÃO encontrado após todas as tentativas.")
-
-        # --- 5. Regex para Valor do Documento ---
-        print("--- DEBUG (V21.0): Tentando encontrar Valor do Documento...")
-        valor_encontrado = None
-        regex_valor = r"([ \d\.]*,\d{2})"
-        regex_lixo = r"[^\n\d]*" 
-        
-        match_valor = re.search(r"(?:=\)\s*)?Valor (?:do )?Documento" + regex_lixo + regex_valor, texto_trabalho, re.IGNORECASE)
-        if match_valor:
-            valor_encontrado = match_valor.group(1)
-            print("--- DEBUG (V21.0): Valor encontrado (T1 - Mesma linha):", valor_encontrado)
-
-        if not valor_encontrado:
-            match_valor = re.search(r"=\)\s*Valor\s*(?:do )?Documento\s*\n" + regex_lixo + regex_valor, texto_trabalho, re.IGNORECASE)
-            if match_valor:
-                valor_encontrado = match_valor.group(1)
-                print("--- DEBUG (V21.0): Valor encontrado (T2 - Fallback = Valor):", valor_encontrado)
-
-        if not valor_encontrado:
-            match_valor = re.search(r"Valor (?:do )?Documento\s*\n" + regex_lixo + regex_valor, texto_trabalho, re.IGNORECASE)
-            if match_valor:
-                valor_encontrado = match_valor.group(1)
-                print("--- DEBUG (V21.0): Valor encontrado (T3 - Rótulo/Valor linhas dif):", valor_encontrado)
-
-        if not valor_encontrado:
-            match_valor = re.search(r"Valor Cobrado" + regex_lixo + regex_valor, texto_trabalho, re.IGNORECASE)
-            if match_valor:
-                valor_encontrado = match_valor.group(1)
-                print("--- DEBUG (V21.0): Valor encontrado (T4 - Valor Cobrado):", valor_encontrado)
-
-        if not valor_encontrado:
-            match_valor = re.search(r"Valor Cobrado\s*\n" + regex_lixo + regex_valor, texto_trabalho, re.IGNORECASE)
-            if match_valor:
-                valor_encontrado = match_valor.group(1)
-                print("--- DEBUG (V21.0): Valor encontrado (T5 - Valor Cobrado linha dif):", valor_encontrado)
-
-        if not valor_encontrado:
-            match_valor = re.search(r"^\s*Valor\s+" + regex_lixo + regex_valor, texto_trabalho, re.IGNORECASE | re.MULTILINE)
-            if match_valor:
-                valor_encontrado = match_valor.group(1)
-                print("--- DEBUG (V21.0): Valor encontrado (T6 - Apenas Valor):", valor_encontrado)
-
-        if valor_encontrado:
-            valor_limpo = valor_encontrado.strip()
-            valor_limpo = re.sub(r'\s', '', valor_limpo)
-            dados_encontrados.valor_documento = valor_limpo
-            print(f"--- DEBUG (V21.0): Valor final limpo: {valor_limpo}")
-        else:
-            print("--- DEBUG (V21.0): Valor NÃO encontrado após todas as tentativas.")
-
-        print(f"--- DEBUG (V21.0): Parse (MODO 1) finalizado para {nome_arquivo_origem}. ---")
-        return dados_encontrados
-
-
-    # --- MODO 2: LÓGICA POSICIONAL (Seu 'parse_boleto_data_posicional') ---
-    
-    def parse_modo2_posicional(self, pil_image_processada: Image, dados_atuais: BoletoData) -> BoletoData:
+    def _extrair_vencimento_regex_contexto(self, ocr_text: str) -> Optional[str]:
         """
-        MODO 2: Extração baseada na POSIÇÃO das palavras na imagem.
-        Usado como fallback para PREENCHER campos que o Modo 1 (Regex) não encontrou.
-        Recebe o objeto BoletoData e o atualiza.
+        Procura a data de vencimento pelo contexto ao redor.
+
+        Ordem: rótulo explícito ("Vencimento: dd/mm/aaaa"), depois qualquer
+        data precedida de "venc" nos 25 caracteres anteriores e, por último,
+        a data mais distante no futuro entre as encontradas.
         """
-        
-        # Verifica quais campos estão faltando
-        campos_faltantes = {
-            k: v for k, v in dataclasses.asdict(dados_atuais).items() 
-            if v == 'Não encontrado' and k in ['vencimento', 'beneficiario', 'valor_documento']
-        }
-        # Converte chaves para os nomes de atributo (ex: 'valor_documento' -> 'Valor_Documento')
-        # Esta é uma parte "feia" da fusão...
-        mapa_campos = {
-            'vencimento': 'Vencimento',
-            'valor_documento': 'Valor_Documento',
-            'beneficiario': 'Beneficiário'
-        }
-        campos_faltantes_orig = {mapa_campos[k]:v for k,v in campos_faltantes.items() if k in mapa_campos}
-        
-        if not campos_faltantes_orig:
-            print(f"--- DEBUG (V21.0): Modo 2 (Posicional) não necessário. Todos os campos principais encontrados.")
-            return dados_atuais # Retorna os dados originais, nada a fazer
-
-        print(f"--- DEBUG (V21.0): Iniciando (MODO 2 - POSICIONAL) para campos faltantes: {list(campos_faltantes_orig.keys())} ---")
-
-        try:
-            # 1. Obter o DataFrame posicional (o "data") do Tesseract
-            data = pytesseract.image_to_data(pil_image_processada, lang=DEFAULT_LANG, output_type=Output.DATAFRAME)
-
-            # --- Limpeza inicial do DataFrame ---
-            data = data[data.conf > OCR_CONF_THRESHOLD] # Usa constante do config
-            data = data.dropna(subset=['text'])
-            data['text'] = data['text'].astype(str).str.strip()
-            data = data[data.text != '']
-
-            # 2. Inicializar listas de keywords e candidatos
-            keywords = {
-                'beneficiario': [],
-                'valor': []
-            }
-            candidates_valor = []
-
-            regex_valor = re.compile(r"^([\d\.OSBl]*[,][\dOS]{2})$")
-
-            # --- Mapeamento de Keywords e Candidatos ---
-            for index, row in data.iterrows():
-                text = row['text']
-                x, y, w, h = row['left'], row['top'], row['width'], row['height']
-                pos = (x + w // 2, y + h // 2)
-                text_upper = text.upper()
-
-                if 'BENEFICI' in text_upper:
-                    keywords['beneficiario'].append((x, y, w, h))
-                if 'VALOR' in text_upper or 'DOCUMENTO' in text_upper or 'COBRADO' in text_upper:
-                    keywords['valor'].append(pos)
-                if regex_valor.match(text):
-                    candidates_valor.append({'text': text, 'pos': pos})
-
-            # --- 3. Lógica de Fusão de Valor (V20.0) ---
-            print("--- DEBUG (V21.0): Iniciando lógica de fusão para Valor...")
-            regex_pre_virgula = re.compile(r"^[\d\.]+$")
-            regex_pos_virgula = re.compile(r"^\d{2}$")
-
-            for i in range(len(data) - 1):
-                row1 = data.iloc[i]
-                row2 = data.iloc[i+1]
-                text1, text2 = row1['text'], row2['text']
-
-                if regex_pre_virgula.match(text1) and regex_pos_virgula.match(text2):
-                    y1, h1 = row1['top'], row1['height']
-                    y2, h2 = row2['top'], row2['height']
-                    x1, w1 = row1['left'], row1['width']
-                    x2 = row2['left']
-                    y_meio1, y_meio2 = y1 + h1 / 2, y2 + h2 / 2
-
-                    if (abs(y_meio1 - y_meio2) < 10) and (x2 > (x1 + w1)) and ((x2 - (x1+w1)) < 50):
-                        fused_text = f"{text1},{text2}"
-                        fused_pos = ( (x1 + x2) // 2, (y1 + y2) // 2 )
-                        candidates_valor.append({'text': fused_text, 'pos': fused_pos})
-                        print(f"--- DEBUG (V21.0): Fusão ACEITA! Criado novo candidato: '{fused_text}'")
-
-            # --- PROCESSA CAMPOS FALTANTES ---
-
-            # 1. Processa Vencimento (V21.0 - Usando suas funções avançadas)
-            if 'Vencimento' in campos_faltantes_orig:
-                print("--- DEBUG (V21.0): Processando Vencimento (Com suas funções avançadas)...")
-                venc_encontrado = self._detectar_vencimento_avancado(data) # Usa método privado
-                
-                if venc_encontrado and venc_encontrado != 'Não encontrado':
-                    dados_atuais.vencimento = self._clean_data(venc_encontrado) # Usa método privado
-                    print(f"--- DEBUG (V21.0): Vencimento ACEITO (Avançado): {dados_atuais.vencimento}")
-                else:
-                    print("--- DEBUG (V21.0): Vencimento (Avançado) - Suas funções não encontraram (Provável falha do OCR).")
-
-            # 2. Processa Valor (ESTRATÉGIA V20.0 - DISTÂNCIA + FUSÃO)
-            if 'Valor_Documento' in campos_faltantes_orig:
-                print("--- DEBUG (V21.0): Processando Valor (Estratégia 'Distância')...")
-
-                if not keywords['valor']:
-                    print("--- DEBUG (V21.0): Valor (Posicional - Distance) - Nenhuma keyword 'Valor' foi lida.")
-                elif not candidates_valor:
-                    print("--- DEBUG (V21.0): Valor (Posicional - Distance) - Nenhum candidato (normal ou fundido) foi encontrado.")
-                else:
-                    valor_encontrado = self._find_closest(keywords['valor'], candidates_valor, VALOR_MAX_DISTANCE) # Usa método privado
-
-                    if valor_encontrado:
-                        valor_limpo = re.sub(r'\s', '', valor_encontrado)
-                        dados_atuais.valor_documento = self._clean_data(valor_limpo) # Usa método privado
-                        print(f"--- DEBUG (V21.0): Valor ACEITO (Posicional - Distance): {dados_atuais.valor_documento}")
-                    else:
-                        print("--- DEBUG (V21.0): Valor (Posicional - Distance) - Nenhuma keyword 'Valor' estava próxima de um candidato.")
-
-            # 3. Processa Beneficiário (ESTRATÉGIA V16.0 - LAYOUT)
-            if 'Beneficiário' in campos_faltantes_orig and keywords['beneficiario']:
-                print(f"--- DEBUG (V21.0): Processando Beneficiário (Estratégia 'Layout V16'). {len(keywords['beneficiario'])} palavras-chave encontradas.")
-                beneficiario_final_encontrado = False
-
-                for i, (x_key, y_key, w_key, h_key) in enumerate(keywords['beneficiario']):
-                    if beneficiario_final_encontrado: break
-                    print(f"--- DEBUG (V21.0): Testando palavra-chave Beneficiário #{i+1}...")
-                    nome_encontrado_bruto = None
-
-                    # TENTATIVA 1: MESMA LINHA
-                    linha_beneficiario = []
-                    y_meio_key, x_fim_key = y_key + h_key / 2, x_key + w_key
-                    y_tolerancia = 20
-
-                    for index, row in data.iterrows():
-                        x_row, y_row, h_row = row['left'], row['top'], row['height']
-                        y_meio_row = y_row + h_row / 2
-                        if (abs(y_meio_row - y_meio_key) < y_tolerancia) and (x_row > x_fim_key):
-                            linha_beneficiario.append({'x': x_row, 'text': row['text']})
-
-                    if linha_beneficiario:
-                        linha_beneficiario.sort(key=lambda item: item['x'])
-                        nome_encontrado_bruto = " ".join([item['text'] for item in linha_beneficiario])
-                        print(f"--- DEBUG (V21.0): Beneficiário (Layout) - Teste #{i+1} 'Mesma Linha' encontrou: '{nome_encontrado_bruto}'")
-                    else:
-                        print(f"--- DEBUG (V21.0): Beneficiário (Layout) - Teste #{i+1} 'Mesma Linha' falhou. Tentando 'Linha Abaixo'...")
-                        # TENTATIVA 2: LINHA ABAIXO
-                        linha_abaixo = []
-                        x_meio_key, y_fim_key = x_key + w_key / 2, y_key + h_key
-                        x_tolerancia_abaixo = 150
-
-                        for index, row in data.iterrows():
-                            x_row, y_row, w_row, h_row = row['left'], row['top'], row['width'], row['height']
-                            x_meio_row = x_row + w_row / 2
-                            if (y_row > y_fim_key) and (abs(x_meio_row - x_meio_key) < x_tolerancia_abaixo):
-                                linha_abaixo.append({'y': y_row, 'x': x_row, 'text': row['text']})
-
-                        if linha_abaixo:
-                            linha_abaixo.sort(key=lambda item: (item['y'], item['x']))
-                            linha_y_proxima = linha_abaixo[0]['y']
-                            palavras_da_linha = []
-                            for item in linha_abaixo:
-                                if abs(item['y'] - linha_y_proxima) < y_tolerancia:
-                                    palavras_da_linha.append(item)
-                                else:
-                                    break
-                            palavras_da_linha.sort(key=lambda item: item['x'])
-                            nome_encontrado_bruto = " ".join([item['text'] for item in palavras_da_linha])
-                            print(f"--- DEBUG (V21.0): Beneficiário (Layout) - Teste #{i+1} 'Linha Abaixo' encontrou: '{nome_encontrado_bruto}'")
-                        else:
-                            print("--- DEBUG (V21.0): Beneficiário (Layout) - Teste #{i+1} 'Linha Abaixo' falhou.")
-
-                    # VALIDAÇÃO FINAL (após T1 ou T2)
-                    if nome_encontrado_bruto:
-                        nome_sem_cnpj = re.sub(r'\s*CNPJ.*$', '', nome_encontrado_bruto, flags=re.IGNORECASE).strip()
-                        if self._is_valid_candidate(nome_sem_cnpj): # Usa método privado
-                            dados_atuais.beneficiario = nome_sem_cnpj
-                            beneficiario_final_encontrado = True
-                            print(f"--- DEBUG (V21.0): Beneficiário ACEITO (Layout) no Teste #{i+1}: {dados_atuais.beneficiario}")
-                        else:
-                            print(f"--- DEBUG (V21.0): Beneficiário REJEITADO (Layout) no Teste #{i+1} pela validação: '{nome_encontrado_bruto}'")
-                
-                if not beneficiario_final_encontrado:
-                    print("--- DEBUG (V21.0): Beneficiário (Layout) - Nenhuma palavra-chave produziu um resultado válido.")
-
-        except Exception as e:
-            # Captura erros inesperados durante o Modo 2
-            print(f"--- ERRO (V21.0): Falha no Modo Posicional: {e} ---")
-            import traceback
-            print(traceback.format_exc()) # Imprime o stack trace completo para depuração
-
-        # Retorna o objeto BoletoData ATUALIZADO
-        return dados_atuais
-
-    # --- FUNÇÕES HELPER (Agora são métodos privados da classe) ---
-
-    def _extrair_vencimento_regex_contexto(self, ocr_text):
-        """ Tenta extrair a data de vencimento do texto completo usando Regex com contexto. (V21.0) """
-        padroes_contexto = [
-            r'vencimento\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-            r'venc\.?\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-            r'vencto\.?\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})'
-        ]
-        for padrao in padroes_contexto:
-            m = re.search(padrao, ocr_text, flags=re.IGNORECASE)
-            if m:
-                return m.group(1)
-
-        datas = re.findall(r'\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b', ocr_text)
-        if datas:
-            for data in datas:
-                idx = ocr_text.find(data)
-                trecho_antes = ocr_text[max(0, idx-25):idx].lower()
-                if "venc" in trecho_antes:
-                    return data
-            try:
-                datas_normalizadas = []
-                for d in datas:
-                    partes = re.split(r'[\/\-\.]', d)
-                    if len(partes[2]) == 2: partes[2] = "20" + partes[2]
-                    if len(partes[0]) == 1: partes[0] = "0" + partes[0]
-                    if len(partes[1]) == 1: partes[1] = "0" + partes[1]
-                    datas_normalizadas.append( ( (partes[2], partes[1], partes[0]), d ) )
-                if datas_normalizadas:
-                    datas_normalizadas.sort(key=lambda x: x[0], reverse=True)
-                    return datas_normalizadas[0][1]
-            except Exception as e:
-                print(f"--- DEBUG (V21.0): Erro ao ordenar datas: {e}. Retornando a última encontrada.")
-                return datas[-1]
-        return None
-
-    def _extrair_vencimento_posicional(self, df):
-        """ Tenta extrair a data de vencimento usando a posição das palavras no DataFrame do Tesseract. (V21.0) """
-        df['text'] = df['text'].astype(str).str.strip()
-        df_filtrado = df[df['text'].str.len() > 0]
-        df_venc = df_filtrado[df_filtrado['text'].str.contains('venc', case=False, na=False)]
-        if df_venc.empty:
+        if not ocr_text:
             return None
-        
-        resultados = []
-        for _, row in df_venc.iterrows():
-            y_ref, x_ref = row['top'], row['left']
-            proximos = df_filtrado[
-                (df_filtrado['top'] >= y_ref - 10) & 
-                (df_filtrado['top'] <= y_ref + 50) & 
-                (df_filtrado['left'] > x_ref)
+
+        for padrao in self.PADROES_VENCIMENTO_CONTEXTO:
+            match = re.search(padrao, ocr_text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+        datas = self.REGEX_DATA.findall(ocr_text)
+        if not datas:
+            return None
+
+        for bruto in datas:
+            indice = ocr_text.find(bruto)
+            if "venc" in ocr_text[max(0, indice - 25):indice].lower():
+                return bruto
+
+        datadas = [(self._parse_data(bruto), bruto) for bruto in datas]
+        validas = [(data, bruto) for data, bruto in datadas if data]
+        if not validas:
+            return None
+        return max(validas, key=lambda item: item[0])[1]
+
+    def _parse_data(self, bruto: Optional[str]) -> Optional[date]:
+        """
+        Converte um texto em data, corrigindo confusões de OCR e validando.
+
+        Rejeita datas impossíveis (32/13/2025) e fora de uma janela plausível,
+        que antes entravam na planilha como string sem nenhuma checagem.
+        """
+        if not bruto:
+            return None
+        limpo = bruto.strip().translate(str.maketrans("OoSsIl|B", "00551118"))
+        partes = re.split(r"[\/\-\.]", limpo)
+        if len(partes) != 3:
+            return None
+        try:
+            dia, mes, ano = (int(parte) for parte in partes)
+        except ValueError:
+            return None
+        if ano < 100:
+            ano += 2000
+        if not ANO_MINIMO_PLAUSIVEL <= ano <= ANO_MAXIMO_PLAUSIVEL:
+            return None
+        try:
+            return date(ano, mes, dia)
+        except ValueError:
+            logger.debug("Data inválida descartada: %s", bruto)
+            return None
+
+    # --- Valor -------------------------------------------------------------
+
+    def _extrair_valor(self, texto: str, dados: BoletoData, origem: str) -> None:
+        if dados.valor_documento.encontrado:
+            return
+        for indice, padrao in enumerate(self.PADROES_VALOR, start=1):
+            match = re.search(padrao, texto, re.IGNORECASE | re.MULTILINE)
+            if not match:
+                continue
+            bruto = match.group(1)
+            valor = self._parse_valor(bruto)
+            if valor and dados.valor_documento.definir(valor, texto_bruto=bruto.strip(), origem=origem):
+                logger.info("Valor por regex (padrão %d): %s", indice, valor)
+                return
+        logger.debug("Valor não encontrado por regex.")
+
+    def _parse_valor(self, bruto: Optional[str]) -> Optional[Decimal]:
+        """
+        Converte "1.234,56" em Decimal("1234.56").
+
+        O separador de milhar é removido em vez de virar hífen — antes,
+        ``_clean_data`` trocava "." por "-" e corrompia todo valor acima de mil.
+        """
+        if not bruto:
+            return None
+        limpo = re.sub(r"[^\d,.]", "", bruto.translate(str.maketrans("OoSsIl|B", "00551118")))
+        limpo = limpo.replace(".", "").replace(",", ".")
+        if not limpo or limpo.count(".") > 1:
+            return None
+        try:
+            valor = Decimal(limpo)
+        except InvalidOperation:
+            return None
+        if valor <= 0 or valor > ld.VALOR_MAXIMO_PLAUSIVEL:
+            return None
+        return valor
+
+    # --- Beneficiário ------------------------------------------------------
+
+    def _extrair_beneficiario(self, texto: str, dados: BoletoData, origem: str) -> None:
+        if dados.beneficiario.encontrado:
+            return
+
+        # 1) Nome na mesma linha de um CNPJ, ou na linha imediatamente acima.
+        match_cnpj = re.search(
+            r"^\s*(.*?CNPJ\s*\d{2}[\.\s]?\d{3}[\.\s]?\d{3}/\d{4}[\-\s]?\d{2}.*)$",
+            texto, re.MULTILINE | re.IGNORECASE,
+        )
+        if match_cnpj:
+            linha = match_cnpj.group(1).strip()
+            match_nome = re.search(r"^([^\n]+?)\s*CNPJ", linha, re.IGNORECASE)
+            if match_nome and self._is_valid_candidate(match_nome.group(1)):
+                self._definir_nome(dados.beneficiario, match_nome.group(1), origem, "mesma linha do CNPJ")
+                return
+            anteriores = texto[:match_cnpj.start()].strip().split("\n")
+            if anteriores and anteriores[-1].strip() and self._is_valid_candidate(anteriores[-1]):
+                self._definir_nome(dados.beneficiario, anteriores[-1], origem, "linha anterior ao CNPJ")
+                return
+
+        # 2) Rótulo "Beneficiário" na mesma linha.
+        match = re.search(
+            r"(?<!CÓDIGO\s)(?<!Agência\s/\sCódigo\s)Benefici[áao]rio[^\w\n]*([^\n]+)",
+            texto, re.MULTILINE | re.IGNORECASE,
+        )
+        if match:
+            nome = re.sub(r"\s*CNPJ.*$", "", match.group(1).strip(), flags=re.IGNORECASE).strip()
+            if self._is_valid_candidate(nome):
+                self._definir_nome(dados.beneficiario, nome, origem, "rótulo na mesma linha")
+                return
+
+        # 3) Rótulo "Beneficiário" com o nome na linha de baixo.
+        match = re.search(
+            r"(?<!CÓDIGO\s)(?<!Agência\s/\sCódigo\s)Benefici[áao]rio\s*\n\s*([^\n]+)",
+            texto, re.MULTILINE | re.IGNORECASE,
+        )
+        if match:
+            nome = match.group(1).strip()
+            if "CNPJ" not in nome.upper() and self._is_valid_candidate(nome):
+                self._definir_nome(dados.beneficiario, nome, origem, "rótulo na linha seguinte")
+                return
+
+        logger.debug("Beneficiário não encontrado por regex.")
+
+    # --- Pagador -----------------------------------------------------------
+
+    def _extrair_pagador(self, texto: str, dados: BoletoData, origem: str) -> None:
+        if dados.pagador.encontrado:
+            return
+
+        match_cpf = re.search(
+            r"CPF[:\s]*(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})",
+            texto, re.MULTILINE | re.IGNORECASE,
+        )
+        if match_cpf:
+            posicao = match_cpf.start()
+            inicio_linha = texto.rfind("\n", 0, posicao) + 1
+            antes_na_linha = texto[inicio_linha:posicao].strip()
+            match_nome = re.search(r"Pagador:?\s+(.+)", antes_na_linha, re.IGNORECASE)
+            if match_nome and self._is_valid_candidate(match_nome.group(1)):
+                self._definir_nome(dados.pagador, match_nome.group(1), origem, "mesma linha do CPF")
+                return
+            linhas = texto[:posicao].strip().split("\n")
+            if len(linhas) > 1 and re.search(r"Pagador", linhas[-2], re.IGNORECASE):
+                if self._is_valid_candidate(linhas[-1]):
+                    self._definir_nome(dados.pagador, linhas[-1], origem, "linha anterior ao CPF")
+                    return
+
+        for padrao in (
+            r"^\s*Pagador:?\s+([^\n]+?)(?=\s*CPF|$)",
+            r"^\s*Pagador\s*\n\s*([^\n]+?)(?=\s*CPF|$)",
+        ):
+            match = re.search(padrao, texto, re.MULTILINE | re.IGNORECASE)
+            if match and self._is_valid_candidate(match.group(1)):
+                self._definir_nome(dados.pagador, match.group(1), origem, "rótulo Pagador")
+                return
+
+        logger.debug("Pagador não encontrado por regex.")
+
+    def _definir_nome(self, campo: Campo, bruto: str, origem: str, como: str) -> None:
+        """Limpa e grava um campo de nome (beneficiário/pagador)."""
+        # Quando o nome e o rótulo estão na mesma linha, a captura pelo CNPJ/CPF
+        # arrasta o rótulo junto ("Beneficiário: EMPRESA X").
+        nome = self.REGEX_ROTULO_INICIAL.sub("", bruto.strip())
+        # Boletos costumam separar o nome do que vem depois com traço ou
+        # travessão; o OCR arrasta esse separador para dentro do nome.
+        nome = re.sub(r"[\s\-–—:;,.]+$", "", nome).strip()
+        nome = re.sub(r"\s{2,}", " ", nome)
+        if campo.definir(nome, texto_bruto=nome, origem=origem):
+            logger.info("Nome encontrado (%s): %s", como, nome)
+
+    def _is_valid_candidate(self, texto: Optional[str]) -> bool:
+        """Descarta candidatos a nome que são claramente rótulo ou ruído."""
+        if not texto:
+            return False
+        texto = texto.strip()
+        if len(texto) <= 3:
+            return False
+        if re.fullmatch(r"[\d\s\.\/\-\,\—]+", texto):
+            return False
+        return not any(lixo in texto.upper() for lixo in self.LIXO_SEM_VALOR)
+
+    # ------------------------------------------------------------------ #
+    # Camada 2: posicional
+    # ------------------------------------------------------------------ #
+
+    def extrair_posicional(self, palavras: Sequence[Palavra], dados: BoletoData) -> BoletoData:
+        """
+        Preenche os campos que faltaram usando as coordenadas das palavras.
+
+        Recebe as palavras já extraídas do Tesseract (uma única passada de OCR
+        alimenta tanto esta camada quanto a de regex).
+        """
+        faltantes = dados.campos_faltantes()
+        if not faltantes:
+            logger.debug("Modo posicional dispensado: campos principais já preenchidos.")
+            return dados
+        if not palavras:
+            return dados
+
+        logger.info("Modo posicional para: %s", ", ".join(faltantes))
+
+        if "vencimento" in faltantes:
+            self._posicional_vencimento(palavras, dados)
+        if "valor_documento" in faltantes:
+            self._posicional_valor(palavras, dados)
+        if "beneficiario" in faltantes:
+            self._posicional_beneficiario(palavras, dados)
+        return dados
+
+    def _posicional_vencimento(self, palavras: Sequence[Palavra], dados: BoletoData) -> None:
+        """Procura uma data à direita (ou logo abaixo) de um rótulo 'Venc'."""
+        rotulos = [p for p in palavras if "venc" in _normalizar(p.texto)]
+        candidatas: List[Tuple[date, Palavra]] = []
+
+        for rotulo in rotulos:
+            for palavra in palavras:
+                perto_na_vertical = rotulo.y - 10 <= palavra.y <= rotulo.y + 50
+                a_direita = palavra.x > rotulo.x
+                if not (perto_na_vertical and a_direita):
+                    continue
+                match = self.REGEX_DATA.search(palavra.texto)
+                if match:
+                    data = self._parse_data(match.group(0))
+                    if data:
+                        candidatas.append((data, palavra))
+
+        if not candidatas:
+            return
+        data, palavra = max(candidatas, key=lambda item: item[0])
+        if dados.vencimento.definir(data, texto_bruto=palavra.texto, origem=Origem.POSICIONAL):
+            dados.vencimento.regiao = palavra.regiao()
+            logger.info("Vencimento posicional: %s", data)
+
+    def _posicional_valor(self, palavras: Sequence[Palavra], dados: BoletoData) -> None:
+        """
+        Acha o valor pelo candidato numérico mais próximo de um rótulo de valor.
+
+        Inclui a "fusão" de valores que o OCR quebrou em duas palavras
+        ("1.234" + "56" lado a lado viram "1.234,56").
+        """
+        regex_candidato = re.compile(r"^([\d\.OSBl]*[,][\dOS]{2})$")
+        rotulos = [
+            p.centro for p in palavras
+            if any(chave in _normalizar(p.texto) for chave in ("valor", "documento", "cobrado"))
+        ]
+        candidatos: List[Tuple[str, Tuple[int, int], Regiao]] = [
+            (p.texto, p.centro, p.regiao()) for p in palavras if regex_candidato.match(p.texto)
+        ]
+        candidatos.extend(self._fundir_valores_quebrados(palavras))
+
+        if not rotulos or not candidatos:
+            logger.debug("Valor posicional: sem rótulo ou sem candidato.")
+            return
+
+        melhor, menor_distancia = None, float("inf")
+        for rotulo in rotulos:
+            for texto, centro, regiao in candidatos:
+                distancia = math.dist(centro, rotulo)
+                if distancia < menor_distancia:
+                    menor_distancia, melhor = distancia, (texto, regiao)
+
+        if melhor is None or menor_distancia >= VALOR_MAX_DISTANCE:
+            return
+        texto, regiao = melhor
+        valor = self._parse_valor(texto)
+        if valor and dados.valor_documento.definir(valor, texto_bruto=texto, origem=Origem.POSICIONAL):
+            dados.valor_documento.regiao = regiao
+            logger.info("Valor posicional: %s (distância %.0f px)", valor, menor_distancia)
+
+    def _fundir_valores_quebrados(
+        self, palavras: Sequence[Palavra]
+    ) -> List[Tuple[str, Tuple[int, int], Regiao]]:
+        """Junta pares de palavras vizinhas que formam um valor com centavos."""
+        regex_inteiro = re.compile(r"^[\d\.]+$")
+        regex_centavos = re.compile(r"^\d{2}$")
+        fundidos = []
+
+        for atual, seguinte in zip(palavras, palavras[1:]):
+            if not (regex_inteiro.match(atual.texto) and regex_centavos.match(seguinte.texto)):
+                continue
+            mesma_linha = abs((atual.y + atual.altura / 2) - (seguinte.y + seguinte.altura / 2)) < 10
+            fim_atual = atual.x + atual.largura
+            adjacentes = fim_atual < seguinte.x < fim_atual + 50
+            if mesma_linha and adjacentes:
+                regiao = unir_regioes([atual, seguinte])
+                texto = f"{atual.texto},{seguinte.texto}"
+                fundidos.append((texto, (regiao.x + regiao.largura // 2, regiao.y + regiao.altura // 2), regiao))
+                logger.debug("Valor reconstruído a partir de duas palavras: %s", texto)
+        return fundidos
+
+    def _posicional_beneficiario(self, palavras: Sequence[Palavra], dados: BoletoData) -> None:
+        """Lê o texto à direita do rótulo 'Beneficiário' ou na linha de baixo."""
+        rotulos = [p for p in palavras if "benefici" in _normalizar(p.texto)]
+        tolerancia_y = 20
+
+        for rotulo in rotulos:
+            meio_y = rotulo.y + rotulo.altura / 2
+            fim_x = rotulo.x + rotulo.largura
+
+            mesma_linha = [
+                p for p in palavras
+                if abs((p.y + p.altura / 2) - meio_y) < tolerancia_y and p.x > fim_x
             ]
-            for _, p in proximos.iterrows():
-                texto = str(p['text'])
-                m = re.search(r'\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b', texto)
-                if m:
-                    resultados.append(m.group(0))
-        
-        if resultados:
-            try:
-                datas_normalizadas = []
-                for d in resultados:
-                    partes = re.split(r'[\/\-\.]', d)
-                    if len(partes[2]) == 2: partes[2] = "20" + partes[2]
-                    if len(partes[0]) == 1: partes[0] = "0" + partes[0]
-                    if len(partes[1]) == 1: partes[1] = "0" + partes[1]
-                    datas_normalizadas.append( ( (partes[2], partes[1], partes[0]), d ) )
-                if datas_normalizadas:
-                    datas_normalizadas.sort(key=lambda x: x[0], reverse=True)
-                    return datas_normalizadas[0][1]
-            except Exception:
-                return resultados[0]
-        return None
+            selecionadas = sorted(mesma_linha, key=lambda p: p.x)
 
-    def _detectar_vencimento_avancado(self, df):
-        """ Orquestra a detecção de vencimento, posicional e depois regex. (V2A21.0) """
-        venc = self._extrair_vencimento_posicional(df)
-        if venc:
-            print(f"--- DEBUG (V21.0): Vencimento encontrado por POSIÇÃO: {venc}")
-            return venc
-        
-        texto_completo = " ".join(df['text'].astype(str).tolist())
-        venc = self._extrair_vencimento_regex_contexto(texto_completo)
-        if venc:
-            print(f"--- DEBUG (V21.0): Vencimento encontrado por CONTEXTO: {venc}")
-            return venc
-        
-        print("--- DEBUG (V21.0): Nenhum vencimento encontrado pelas funções avançadas.")
-        return "Não encontrado"
+            if not selecionadas:
+                abaixo = [
+                    p for p in palavras
+                    if p.y > rotulo.y + rotulo.altura
+                    and abs((p.x + p.largura / 2) - (rotulo.x + rotulo.largura / 2)) < 150
+                ]
+                if not abaixo:
+                    continue
+                abaixo.sort(key=lambda p: (p.y, p.x))
+                primeira_linha_y = abaixo[0].y
+                selecionadas = sorted(
+                    [p for p in abaixo if abs(p.y - primeira_linha_y) < tolerancia_y],
+                    key=lambda p: p.x,
+                )
 
-    def _is_valid_candidate(self, text):
-        """ Verifica se um texto extraído parece ser um nome válido. (V5.1) """
-        if not text: return False
-        text = text.strip()
-        if len(text) <= 3:
-            return False
-        if re.fullmatch(r"[\d\s\.\/\-\,\—]+", text):
-            return False
-        lixo_sem_valor = ["NOSSO NÚMERO", "AGÊNCIA", "CÓDIGO BENEFICIÁRIO", "VENCIMENTO", "RECIBO DO PAGADOR", "AUTENTICAÇÃO MECANICA"]
-        if any(k in text.upper() for k in lixo_sem_valor):
-            return False
-        return True
+            if not selecionadas:
+                continue
 
-    def _find_closest(self, keyword_pos_list, candidates_list, max_dist_threshold):
-        """ FUNÇÃO HELPER: ACHAR MAIS PRÓXIMO (V20.0) """
-        if not keyword_pos_list or not candidates_list: return None
-        closest_candidate = None
-        min_dist = float('inf')
+            bruto = " ".join(p.texto for p in selecionadas)
+            nome = re.sub(r"\s*CNPJ.*$", "", bruto, flags=re.IGNORECASE).strip()
+            if self._is_valid_candidate(nome):
+                if dados.beneficiario.definir(nome, texto_bruto=nome, origem=Origem.POSICIONAL):
+                    dados.beneficiario.regiao = unir_regioes(selecionadas)
+                    logger.info("Beneficiário posicional: %s", nome)
+                return
 
-        for key_pos in keyword_pos_list:
-            for candidate in candidates_list:
-                dist = math.sqrt((candidate['pos'][0] - key_pos[0])**2 + (candidate['pos'][1] - key_pos[1])**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_candidate = candidate['text']
-        
-        if min_dist < max_dist_threshold: # Usa constante do config
-            return closest_candidate
-        return None
+    # ------------------------------------------------------------------ #
+    # Localização visual dos campos
+    # ------------------------------------------------------------------ #
 
-    def _clean_data(self, text_sujo):
-        """ FUNÇÃO HELPER: LIMPEZA (V19.0) """
-        text_sujo = text_sujo.replace("/", "-").replace(".", "-")
-        return text_sujo.replace("O", "0").replace("S", "5").replace("B", "8").replace("l", "1")
+    def localizar_campos(self, palavras: Sequence[Palavra], dados: BoletoData) -> BoletoData:
+        """
+        Preenche a ``regiao`` dos campos que ainda não têm coordenadas.
+
+        É o que permite ao modo de inspeção desenhar a caixa também sobre
+        campos achados por regex ou pela linha digitável.
+        """
+        for nome, campo in dados.campos().items():
+            if campo.encontrado and campo.regiao is None and campo.texto_bruto:
+                campo.regiao = localizar_texto(
+                    palavras, campo.texto_bruto, perto_de=self.ROTULOS_POR_CAMPO.get(nome, ())
+                )
+
+        # Vencimento e valor vindos da linha digitável muitas vezes não existem
+        # como texto legível na página (o OCR falha justamente no campo impresso
+        # que o código de barras já informa). Nesses casos apontamos para a
+        # linha digitável, que é de onde o dado realmente veio.
+        regiao_codigo = dados.codigo_barras.regiao
+        if regiao_codigo is not None:
+            for nome in ("vencimento", "valor_documento"):
+                campo = getattr(dados, nome)
+                if campo.encontrado and campo.regiao is None and campo.origem == Origem.LINHA_DIGITAVEL:
+                    campo.regiao = regiao_codigo
+                    campo.regiao_herdada = True
+        return dados
+
+
+# --- Conversões de fontes de palavras --------------------------------------
+
+def palavras_do_dataframe(data: pd.DataFrame, pagina: int = 0, escala: float = 1.0) -> List[Palavra]:
+    """
+    Converte o DataFrame do ``pytesseract`` em palavras posicionadas.
+
+    ``escala`` reduz as coordenadas do espaço da imagem pré-processada (que é
+    ampliada antes do OCR) para o da imagem original exibida ao usuário.
+    """
+    if data is None or data.empty:
+        return []
+    filtrado = data.dropna(subset=["text"]).copy()
+    filtrado["text"] = filtrado["text"].astype(str).str.strip()
+    filtrado = filtrado[filtrado["text"] != ""]
+    if "conf" in filtrado.columns:
+        filtrado = filtrado[pd.to_numeric(filtrado["conf"], errors="coerce") > OCR_CONF_THRESHOLD]
+    fator = 1.0 / escala if escala else 1.0
+    return [
+        Palavra(
+            linha["text"],
+            linha["left"] * fator, linha["top"] * fator,
+            linha["width"] * fator, linha["height"] * fator,
+            pagina,
+        )
+        for _, linha in filtrado.iterrows()
+    ]
+
+
+def texto_do_dataframe(data: pd.DataFrame) -> str:
+    """
+    Reconstrói o texto corrido a partir do DataFrame do Tesseract.
+
+    Reagrupar por bloco/parágrafo/linha reproduz o que ``image_to_string``
+    devolveria — o que evita rodar o OCR duas vezes sobre a mesma imagem.
+    As regex dependem das quebras de linha, então elas são preservadas.
+    """
+    if data is None or data.empty:
+        return ""
+    filtrado = data.dropna(subset=["text"]).copy()
+    filtrado["text"] = filtrado["text"].astype(str)
+    filtrado = filtrado[filtrado["text"].str.strip() != ""]
+    if filtrado.empty:
+        return ""
+
+    chaves = [c for c in ("page_num", "block_num", "par_num", "line_num") if c in filtrado.columns]
+    if not chaves:
+        return " ".join(filtrado["text"])
+
+    linhas = []
+    for _, grupo in filtrado.groupby(chaves, sort=True):
+        if "word_num" in grupo.columns:
+            grupo = grupo.sort_values("word_num")
+        linhas.append(" ".join(grupo["text"].tolist()).strip())
+    return "\n".join(linha for linha in linhas if linha)
+
+
+def palavras_do_pdf(palavras_fitz: Iterable, escala: float, pagina: int = 0) -> List[Palavra]:
+    """
+    Converte as palavras do PyMuPDF (``page.get_text("words")``) para pixels.
+
+    O PDF trabalha em pontos e a imagem renderizada em pixels; ``escala`` é a
+    razão entre os dois, para que as caixas caiam no lugar certo na imagem.
+    """
+    convertidas = []
+    for entrada in palavras_fitz:
+        x0, y0, x1, y1, texto = entrada[0], entrada[1], entrada[2], entrada[3], entrada[4]
+        convertidas.append(
+            Palavra(
+                texto,
+                int(x0 * escala), int(y0 * escala),
+                int((x1 - x0) * escala), int((y1 - y0) * escala),
+                pagina,
+            )
+        )
+    return convertidas

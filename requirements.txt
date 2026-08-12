@@ -1,14 +1,14 @@
-# Bibliotecas principais do aplicativo
-pandas
-openpyxl
-pytesseract
-PyMuPDF
-opencv-python-headless
-Pillow
-numpy
+# Dependências de execução do AutoScanExtractor.
+# Ferramentas de desenvolvimento (pytest, ruff, pyinstaller) estão em
+# requirements-dev.txt, para que a instalação de uso não puxe o que não precisa.
+#
+# As versões têm piso definido: sem isso, uma mudança incompatível em pandas ou
+# Pillow quebra o build sem nenhuma alteração no código do projeto.
 
-# Ferramenta de compilação
-pyinstaller
-
-# Ferramenta de testes
-pytest
+pandas>=2.0,<3.0
+openpyxl>=3.1,<4.0
+pytesseract>=0.3.10,<0.4
+PyMuPDF>=1.23,<2.0
+opencv-python-headless>=4.8,<5.0
+Pillow>=10.0,<12.0
+numpy>=1.24,<3.0

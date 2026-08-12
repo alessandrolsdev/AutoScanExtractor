@@ -1,50 +1,60 @@
-# Nome do seu fluxo de trabalho (aparecerá no GitHub)
-name: Testes Automatizados (CI com Pytest)
+# Testes automatizados.
+#
+# Roda em todos os branches e pull requests: antes o gatilho estava preso ao
+# `main`, então o trabalho feito em branch só era verificado depois do merge —
+# exatamente quando o defeito já custa caro.
+name: CI
 
-# Gatilhos: Quando este fluxo de trabalho deve rodar
 on:
-  # Roda toda vez que você der 'push' para o branch 'main'
   push:
-    branches: [ "main" ]
-  # Roda também se alguém abrir um 'Pull Request' para o 'main'
+    branches: ["**"]
   pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
 
-# Trabalhos (Jobs): O que o robô deve fazer
 jobs:
-  # Definimos um único trabalho (job) chamado "build-and-test"
-  build-and-test:
-    
-    # Sistema Operacional: Usamos o Ubuntu (Linux) porque é rápido
-    # e fácil de instalar o Tesseract
+  lint:
+    name: Análise estática
     runs-on: ubuntu-latest
-
-    # Passos (Steps): A receita que o robô vai seguir
     steps:
-    # Passo 1: Baixar seu código do GitHub para a máquina virtual
-    - name: 1. Fazer Checkout do código
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    # Passo 2: Configurar o Python na máquina
-    - name: 2. Configurar o Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11" # Usamos uma versão moderna do Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    # Passo 3: Instalar as dependências do Sistema (O TESSERACT)
-    - name: 3. Instalar Tesseract OCR (e idioma Português)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y tesseract-ocr tesseract-ocr-por
+      - name: Instalar ruff
+        run: pip install ruff
 
-    # Passo 4: Instalar as dependências do Python (do seu requirements.txt)
-    - name: 4. Instalar dependências Python
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        # O pytest será instalado por esta linha
+      # F821 (nome indefinido) é a regra que teria pego, sem executar nada, o
+      # `dataclasses.asdict` sem import que quebrava todo PDF digital.
+      - name: Rodar ruff
+        run: ruff check .
 
-    # Passo 5: Rodar os testes!
-    - name: 5. Executar os testes (pytest)
-      run: |
-        pytest
+  testes:
+    name: Testes (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Instalar Tesseract OCR (com português)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-por
+
+      - name: Instalar dependências Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Rodar a suíte de testes
+        run: pytest

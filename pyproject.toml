@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoscanextractor"
+description = "Extrai vencimento, valor, beneficiário, pagador e código de barras de boletos bancários (PDF ou imagem) para uma planilha Excel."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dynamic = ["version"]
+dependencies = [
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "pytesseract>=0.3.10",
+    "PyMuPDF>=1.23",
+    "opencv-python-headless>=4.8",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+    "pyinstaller>=6.0",
+]
+
+[project.scripts]
+autoscan = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "boleto_data",
+    "cli",
+    "config",
+    "extraction_logic",
+    "extractor_service",
+    "file_processor",
+    "gui",
+    "linha_digitavel",
+    "main",
+    "planilha",
+    "version",
+    "visualizer",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "version.__version__" }
+
+[tool.pytest.ini_options]
+# Substitui os sys.path.insert que existiam em cada arquivo de teste.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-v --strict-markers"
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+# F inclui F821 (nome indefinido) — a regra que teria pego, ainda no editor,
+# o `dataclasses.asdict` sem import que quebrava todo PDF digital.
+#   E4/E7/E9 — erros reais de sintaxe e semântica
+#   F         — inclui F821 (nome indefinido)
+#   B         — armadilhas comuns (flake8-bugbear)
+# Regras de estilo puro ficam de fora: o objetivo aqui é barrar defeito, não
+# uniformizar gosto.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = [
+    "B008",  # chamadas em valores padrão: usadas de propósito nas fixtures
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

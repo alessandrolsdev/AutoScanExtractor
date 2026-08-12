@@ -1,0 +1,125 @@
+# Compila o executável do Windows e publica na página de Releases.
+#
+# O PyInstaller não faz compilação cruzada: um .exe precisa ser gerado em uma
+# máquina Windows. Este workflow faz isso em um runner windows-latest, embute o
+# Tesseract (com o idioma português) no executável e anexa o .zip à release.
+#
+# Disparo: ao empurrar uma tag `v*` (ex.: v2.0.0), ou manualmente pela aba
+# Actions.
+name: Release (executável Windows)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag da release a criar (ex.: v2.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TESSERACT_DIR: C:\Program Files\Tesseract-OCR
+  # Modelo "fast": bem menor que o "best" e suficiente para boleto impresso.
+  URL_TESSDATA: https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main
+
+jobs:
+  build:
+    name: Compilar e publicar
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar Tesseract OCR
+        run: choco install tesseract --no-progress -y
+
+      - name: Instalar idioma português e conferir a instalação
+        shell: pwsh
+        run: |
+          $tessdata = Join-Path $env:TESSERACT_DIR 'tessdata'
+          if (-not (Test-Path $tessdata)) {
+            New-Item -ItemType Directory -Path $tessdata -Force | Out-Null
+          }
+          foreach ($idioma in @('por', 'osd')) {
+            $destino = Join-Path $tessdata "$idioma.traineddata"
+            if (-not (Test-Path $destino)) {
+              Invoke-WebRequest -Uri "$env:URL_TESSDATA/$idioma.traineddata" -OutFile $destino
+            }
+          }
+          & "$env:TESSERACT_DIR\tesseract.exe" --version
+          & "$env:TESSERACT_DIR\tesseract.exe" --list-langs
+
+      - name: Instalar dependências Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Rodar a suíte no Windows antes de publicar: é o sistema onde o
+      # executável vai ser usado, e é lá que os caminhos costumam divergir.
+      - name: Rodar os testes no Windows
+        env:
+          TESSERACT_CMD: C:\Program Files\Tesseract-OCR\tesseract.exe
+        run: pytest -q
+
+      - name: Compilar o executável
+        run: pyinstaller AutoScanExtractor.spec --noconfirm
+
+      - name: Conferir o executável gerado
+        shell: pwsh
+        run: |
+          $exe = 'dist\AutoScanExtractor.exe'
+          if (-not (Test-Path $exe)) { throw "Executável não foi gerado em $exe" }
+          $tamanho = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "Executável gerado: $tamanho MB"
+          # Fumaça: o .exe precisa ao menos responder pela linha de comando.
+          & $exe --versao
+          if ($LASTEXITCODE -ne 0) { throw "O executável não respondeu a --versao" }
+
+      - name: Montar o pacote da release
+        shell: pwsh
+        run: |
+          $pasta = 'pacote\AutoScanExtractor'
+          New-Item -ItemType Directory -Path $pasta -Force | Out-Null
+          Copy-Item 'dist\AutoScanExtractor.exe' $pasta
+          Copy-Item 'README.md' $pasta
+          Copy-Item 'LICENSE' $pasta
+          Compress-Archive -Path "$pasta\*" -DestinationPath 'AutoScanExtractor-windows.zip' -Force
+
+      - name: Publicar a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: AutoScanExtractor ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            AutoScanExtractor-windows.zip
+            dist/AutoScanExtractor.exe
+          body: |
+            ## AutoScanExtractor ${{ github.event.inputs.tag || github.ref_name }}
+
+            Executável para Windows com o Tesseract OCR (idioma português) já
+            embutido — não é preciso instalar nada.
+
+            ### Como usar
+
+            **Interface gráfica:** baixe o `.zip`, extraia e abra
+            `AutoScanExtractor.exe` com dois cliques.
+
+            **Linha de comando:** o mesmo executável aceita argumentos.
+
+            ```
+            AutoScanExtractor.exe extrair -e C:\boletos -s planilha.xlsx
+            AutoScanExtractor.exe inspecionar boleto.pdf
+            ```
+
+            O comando `inspecionar` gera uma imagem do boleto com um retângulo
+            colorido sobre cada dado encontrado, indicando de onde cada
+            informação foi lida.

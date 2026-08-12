@@ -2,26 +2,18 @@
 """
 main.py
 
-Ponto de entrada principal da aplicação AutoScanExtractor.
+Ponto de entrada do AutoScanExtractor.
 
-Responsabilidades:
-1. Importar e rodar o setup do Tesseract.
-2. Inicializar o Tkinter.
-3. Instanciar e iniciar a classe 'App' da GUI.
+Sem argumentos abre a interface gráfica; com argumentos, delega para a CLI::
+
+    python main.py                                  # interface gráfica
+    python main.py extrair -e boletos/ -s saida.xlsx
+    python main.py inspecionar boleto.pdf
 """
 
-import tkinter as tk
-from gui import App
-from config import setup_tesseract
+import sys
+
+from cli import main
 
 if __name__ == "__main__":
-    # 1. Configura o Tesseract ANTES de criar a GUI
-    print("INFO: Configurando Tesseract...")
-    setup_tesseract()
-    print("INFO: Tesseract configurado.")
-
-    # 2. Inicia a aplicação GUI
-    print("INFO: Iniciando a aplicação...")
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    sys.exit(main())

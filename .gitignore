@@ -2,6 +2,9 @@
 /build/
 /dist/
 *.spec
+# O .spec do projeto é versionado de propósito: sem ele o build documentado no
+# README não é reproduzível por quem clona o repositório.
+!AutoScanExtractor.spec
 
 # Cache e logs do Python
 __pycache__/
