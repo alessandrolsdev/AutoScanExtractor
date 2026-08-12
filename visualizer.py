@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from boleto_data import BoletoData
+from boleto_data import BoletoData, formatar_moeda
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +94,7 @@ def formatar_valor_campo(nome: str, valor) -> str:
     if isinstance(valor, date):
         return valor.strftime("%d/%m/%Y")
     if isinstance(valor, Decimal):
-        inteiro = f"{valor:,.2f}"
-        return "R$ " + inteiro.replace(",", "@").replace(".", ",").replace("@", ".")
+        return formatar_moeda(valor)
     return str(valor)
 
 

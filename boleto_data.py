@@ -97,6 +97,18 @@ class Campo:
 TEXTO_NAO_ENCONTRADO = "Não encontrado"
 
 
+def formatar_moeda(valor: Optional[Decimal]) -> str:
+    """
+    Formata um valor no padrão brasileiro: ``R$ 1.234,56``.
+
+    Feito na mão porque depender de locale exigiria que o pt_BR estivesse
+    instalado na máquina — o que não vale supor em um executável distribuído.
+    """
+    if valor is None:
+        return "—"
+    return "R$ " + f"{valor:,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
+
+
 @dataclass
 class BoletoData:
     """Dados extraídos de um boleto."""
@@ -186,7 +198,7 @@ class BoletoData:
     def resumo(self) -> str:
         """Uma linha de log com o essencial da extração."""
         venc = self.vencimento.valor.strftime("%d/%m/%Y") if isinstance(self.vencimento.valor, date) else "—"
-        valor = f"R$ {self.valor_documento.valor:,.2f}" if self.valor_documento.encontrado else "—"
+        valor = formatar_moeda(self.valor_documento.valor)
         selo = " [DV ok]" if self.linha_digitavel_valida else ""
         return f"venc: {venc} | valor: {valor}{selo}"
 
